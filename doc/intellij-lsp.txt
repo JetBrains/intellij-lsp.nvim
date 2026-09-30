@@ -1,0 +1,345 @@
+*intellij-lsp.txt*  *intellij-lsp*  IntelliJ Language Server client for Neovim (Java + Kotlin)
+
+==============================================================================
+CONTENTS                                                *intellij-lsp-contents*
+
+    1. Introduction ......................... |intellij-lsp-introduction|
+    2. Setup ................................. |intellij-lsp-setup|
+    3. Options ............................... |intellij-lsp-options|
+    4. Commands ............................... |intellij-lsp-commands|
+    5. Navigation and editing ................. |intellij-lsp-navigation|
+    6. Running and debugging .................. |intellij-lsp-run-debug|
+    7. Git .................................... |intellij-lsp-git|
+    8. Health check ........................... |intellij-lsp-health|
+    9. Troubleshooting ......................... |intellij-lsp-troubleshooting|
+
+==============================================================================
+1. Introduction                                     *intellij-lsp-introduction*
+
+A thin Neovim client for the `intellij-server` bundle. It gives Java and
+Kotlin indexing, navigation, diagnostics, completion, running and debugging
+from a single server.
+
+Requires Neovim 0.11+.
+
+See |README.md| in this plugin's directory for the full manual, including
+extended rationale for each behaviour. This help file covers setup,
+options, and commands.
+
+==============================================================================
+2. Setup                                                  *intellij-lsp-setup*
+
+With no `server_path`, the plugin downloads the published bundle for
+your platform on the first `setup()`: >lua
+
+    require('intellij-lsp').setup({})
+<
+The archive is about 380 MB. The download runs in the background and
+reports its progress in the message area. Its checksum is verified and it
+is cached under `stdpath('data') .. '/intellij-lsp/server'`. See
+|intellij-lsp-server_download|.
+
+Or point the plugin at a server bundle you already have: >lua
+
+    require('intellij-lsp').setup({
+      server_path = '/path/to/intellij-server/bin/intellij-server',
+    })
+<
+Then run `:checkhealth intellij-lsp`.
+
+==============================================================================
+3. Options                                              *intellij-lsp-options*
+
+Pass these to `require('intellij-lsp').setup({...})`.
+
+server_path                                            *intellij-lsp-server_path*
+    Path to `bin/intellij-server`. Unset downloads the published bundle
+    for this platform. Default: unset.
+
+server_download                                 *intellij-lsp-server_download*
+    Download and cache the published bundle when `server_path` is unset.
+    Bundles exist for macOS, Linux and Windows, on aarch64 and x86_64.
+    `false` makes `server_path` required. Default: true.
+
+accept_eula
+    Accept the bundle's `EULA.txt`. Required for released bundles; dev
+    builds carry no EULA. Default: false.
+
+build_tool
+    Force an importer: "maven", "gradle", "bazel", "jps". Unset
+    auto-detects; "" skips import. Default: unset.
+
+default_sdk
+    JDK home used to analyze your code (not to run the server).
+    Default: unset.
+
+projects
+    Explicitly configured projects, when auto-detection is not enough.
+    Default: {}.
+
+jvm_args
+    Extra JVM options for the server process. Default: unset.
+
+filetypes
+    Filetypes that trigger a server start. Default: { 'java', 'kotlin' }.
+
+autotrigger
+    Open the completion menu on '.'. Set false to require <C-x><C-o>.
+    Default: true.
+
+completeopt
+    Adjusts 'completeopt' for dotted candidates. false keeps your value.
+    Default: unset.
+
+word_triggers
+    Also request completion while typing letters, digits and '_'.
+    Default: true.
+
+completion_delay
+    Debounce in ms before a word-triggered completion request.
+    Default: 100.
+
+enter_accepts_completion
+    Map <CR> to accept the selected completion. Default: true.
+
+references
+    `grr` opens a quickfix list that live-previews the selected reference.
+    Default: true.
+
+inlay_hints
+    Show parameter and type hints. Default: true.
+
+inlay_hint_settings
+    Merged over the built-in hint defaults. Default: unset.
+
+folding
+    Fold with the server's folding ranges. Default: true.
+
+document_highlight
+    Highlight every occurrence of the identifier under the cursor after
+    'updatetime' of stillness, like IntelliJ's identifier-under-caret
+    highlight. Uses the `LspReference*` groups. Default: true.
+
+signature_help
+    Open the parameter popup when typing `(` or `,` inside a call. <C-S>
+    in insert mode works either way. Default: true.
+
+keymaps
+    Install the buffer-local <leader> maps for type and call hierarchy
+    and workspace symbol search (see |intellij-lsp-navigation|). The
+    commands exist either way. Default: true.
+
+format_on_save
+    Format the whole buffer with IntelliJ's formatter before every write.
+    `:IntellijLspFormat` does the same by hand. Default: false.
+
+file_templates                                    *intellij-lsp-file_templates*
+    Fill a new, empty `.java` or `.kt` file from an IntelliJ file template
+    (Class, Interface, Record, Enum, ...), picked from a list when the
+    buffer attaches. The server fills in the package line from the file's
+    place in the source tree. A table `{ java = { Name = text }, kotlin =
+    { ... } }` adds templates or replaces the built-in ones; an entry set
+    to false removes one. The template language is IntelliJ's, with
+    `${NAME}` and `${PACKAGE_NAME}`, and `|` marks where the cursor ends.
+    `:IntellijLspFileTemplate` opens the picker by hand. Default: true.
+
+intellij_extensions                          *intellij-lsp-intellij_extensions*
+    Opt into the `intellij/` protocol extensions. Without them the server
+    drops every quick fix that copies to the clipboard, offers variants,
+    or ends in a rename. With them, fixes are also listed lazily: `gra`
+    shows them without running them, and the one you pick is performed
+    then. Refactorings that would break usages ask first, with a list of
+    the conflicts; pick one to jump to it, or Continue or Cancel.
+    Default: true.
+
+decompiler
+    Open `jar:`/`jrt:` URIs as decompiled source. Default: true.
+
+rename_files
+    Register `:IntellijLspRename`. Default: false.
+
+colorscheme
+    Apply the bundled `islands-dark` scheme, unless a colorscheme is
+    already in effect when `setup()` runs. Needs 'termguicolors'.
+    Default: true.
+
+nowrap
+    Set 'nowrap', so a long line scrolls right instead of wrapping,
+    like IntelliJ's default. Default: false.
+
+progress
+    Report import and indexing phase in the message area. Default: true.
+
+single_key_select
+    Answer numbered prompts with a bare digit. Default: true.
+
+git
+    Register `:IntellijGitStatus` and `:IntellijGitDiff`. Default: true.
+
+run
+    Run the main class at the cursor with <leader>rr. Needs nvim-dap.
+    Default: true.
+
+debug
+    Breakpoints, stepping, and a stack-and-variables panel. Needs `run`
+    and nvim-dap. Default: true.
+
+==============================================================================
+4. Commands                                            *intellij-lsp-commands*
+
+:IntellijLspRestart            Restart the server.
+:IntellijLspClearCache         Stop the server, delete the index, restart.
+                                The cache directory is per project; a second
+                                Neovim on the same project gets a `-2` suffixed
+                                one, as the server locks its index exclusively.
+:IntellijLspOutput             Open the output panel: the build tool's
+                                import log and program output.
+:IntellijLspLog                Alias of :IntellijLspOutput.
+:IntellijLspReferences         Browse references (what `grr` calls).
+:IntellijLspReload             Re-apply `setup()` options, no restart.
+:IntellijLspTypeHierarchy [dir]  Type hierarchy of the symbol at the cursor,
+                                `subtypes` (default) or `supertypes`.
+:IntellijLspCallHierarchy [dir]  Call hierarchy of the method at the cursor,
+                                `incoming` (default) or `outgoing`.
+:[range]IntellijLspFormat        Format the buffer, or the range, with
+                                IntelliJ's formatter. `gq` formats a motion.
+:IntellijLspSymbols [query]      Search classes, methods and fields across
+                                the project; prompts without a query.
+:IntellijLspCompilationErrors    Compiler-level errors for this file, shown
+                                as diagnostics and in the location list.
+:IntellijLspExportWorkspace [dir]  Write the server's `workspace.json` (the
+                                imported modules, roots, libraries and SDKs)
+                                to `dir`, default the project root. Attach
+                                it to import bug reports.
+:IntellijLspFileTemplate         Fill this empty file from a file template.
+:IntellijLspRename {path}      Rename the current file, updating
+                                references first. Needs `rename_files`.
+:IntellijGitStatus              The change list, with a live diff preview.
+:IntellijGitDiff [rev]           Side-by-side diff against the index, or `rev`.
+:IntellijGitLog [rev-range]      Browse and filter the commit log.
+:IntellijGitBranches             List branches and switch between them.
+:IntellijLspRun                  Run the main class at the cursor.
+:IntellijLspRunStop              Stop the running program.
+:IntellijLspDebug                Debug the main class at the cursor.
+:IntellijLspDebugStop            End the debug session.
+:IntellijLspBreakpointToggle      Set a breakpoint on this line.
+:IntellijLspBreakpointCondition   Set a conditional breakpoint on this line.
+:IntellijLspBreakpointClearAll    Clear every breakpoint.
+:IntellijLspBreakpointList        List breakpoints in the quickfix window.
+:IntellijLspDebugContinue         Continue a suspended program.
+:IntellijLspDebugStepOver         Step over.
+:IntellijLspDebugStepInto         Step into.
+:IntellijLspDebugStepOut          Step out.
+:IntellijLspDebugEvaluate [expr]  Evaluate in the current frame.
+:IntellijLspDebugWatch [expr]     Watch an expression across stops.
+
+==============================================================================
+5. Navigation and editing                            *intellij-lsp-navigation*
+
+Neovim's built-in LSP mappings (`gd`, `K`, `gra`, `grn`, `grr`, `]d`, ...)
+all work. On top of them, in a Java or Kotlin buffer:
+
+    <leader>ts    type hierarchy: subtypes of the class at the cursor
+    <leader>tu    type hierarchy: supertypes
+    <leader>ci    call hierarchy: who calls the method at the cursor
+    <leader>co    call hierarchy: what the method at the cursor calls
+    <leader>ws    search workspace symbols (prompts for a query)
+
+Set `keymaps = false` to keep these off and use the commands instead.
+
+Typing `(` or `,` inside a call opens the parameter popup
+(`signature_help`). After 'updatetime' with the cursor still, every
+occurrence of the identifier under it is highlighted (`document_highlight`).
+
+Formatting: `gq` formats a motion or selection, `:IntellijLspFormat` the
+whole buffer, and `format_on_save = true` does it on every write.
+
+Quick fixes: `gra` lists IntelliJ's intentions and fixes for the cursor.
+Some ask which variant you want, some end in a live template you type
+over (a new variable's name, say), and some start a rename; these need
+`intellij_extensions` (the default). A refactoring that would break
+usages first shows the conflicts and asks whether to continue.
+
+New files: an empty `.java` or `.kt` file offers a file template when the
+server attaches; see |intellij-lsp-file_templates|.
+
+Compiler errors: diagnostics are IntelliJ's inspections. For what the
+compiler itself would say, run `:IntellijLspCompilationErrors`.
+
+==============================================================================
+6. Running and debugging                              *intellij-lsp-run-debug*
+
+Put the cursor inside a class with a `main` method and press <leader>rr to
+run it, or <leader>rd to debug it. Running and debugging need
+https://github.com/mfussenegger/nvim-dap.
+
+    <leader>rr    run the main class at the cursor
+    <leader>rl    run the code lens on the current line
+    <leader>b     toggle a breakpoint on this line
+    <leader>B     breakpoint with a condition
+    <leader>dc    continue
+    <leader>dn/di/do   step over / into / out
+    <leader>dq    stop the session
+    <leader>de    evaluate the expression at the cursor
+    <leader>dw    watch the expression at the cursor
+
+Program output and the build tool's import output (Maven's or Gradle's
+console) share one bottom panel. `build_output` in setup() decides when
+the import opens it: 'always', 'on_failure' (default) or 'never'. In the
+panel, q closes, <C-c> stops the program, <CR> opens the file a stack
+frame or compiler message refers to.
+
+See the README's "Running", "Debugging" and "Build output" sections for
+the full panel keymaps and behaviour.
+
+==============================================================================
+7. Git                                                       *intellij-lsp-git*
+
+Read-only: a change list, a diff view, the commit log, and branch
+switching. Drives the `git` CLI directly, so it works in any filetype and
+needs no server configured.
+
+See the README's "Git" section for the full command reference and panel
+keymaps.
+
+==============================================================================
+8. Health check                                           *intellij-lsp-health*
+
+Run `:checkhealth intellij-lsp` to check:
+
+    - whether a downloaded server bundle is cached
+    - whether the server binary exists and is executable
+    - the bundled JBR and server version
+    - EULA acceptance, when the bundle requires it
+    - the project root and detected build system
+    - running servers, including a probe for an unlicensed (parked) server
+    - the server's own verdict on the last import, folder by folder, and
+      any folder it could not import (two build systems side by side,
+      no build file, ...)
+
+==============================================================================
+9. Troubleshooting                                 *intellij-lsp-troubleshooting*
+
+The server exits immediately~
+    Most likely an expired build (exit code 7). EAP bundles expire; build
+    or fetch a fresh one.
+
+Everything is silent, no results, no errors~
+    An unlicensed server starts normally and then rejects every
+    non-licensing request. `:checkhealth intellij-lsp` detects this.
+
+Nothing gets imported~
+    If a root contains more than one build system, the server asks which
+    to use. If that prompt was dismissed, the plugin asks once more with
+    the candidates, and `:checkhealth intellij-lsp` names the blocked
+    folder and the reason. Set |intellij-lsp-options| `build_tool` to
+    decide up front, or run `:IntellijLspReload` to be asked again.
+
+Go-to-definition into a library or the JDK opens an empty buffer~
+    Set `decompiler = true` (the default).
+
+See the README's "Troubleshooting" section for more detail, and for
+writing your own probes against the server.
+
+==============================================================================
+vim:tw=78:ts=8:noet:ft=help:norl:
