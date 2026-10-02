@@ -428,33 +428,49 @@ check('<CR> still opens a line with no menu', vim.deep_equal(newline, { 'foo', '
 -- requests completion ONLY on trigger characters. So `java.` opened a menu, the next keystroke
 -- closed it, and nothing reopened it -- and a bare identifier never completed at all. This runs
 -- against a real in-process LSP server, because the bug is in when requests are sent.
-local requests = {}
+local requests, cancels = {}, 0
+-- How long the faux server takes to answer a completion request; 0 answers inline.
+local faux_latency = 0
 
 --- Minimal server: one trigger character, FQ filterText, edits anchored at the start of the
---- dotted expression -- the shape `LSJavaCompletionProvider` produces.
+--- dotted expression -- the shape `LSJavaCompletionProvider` produces. Distinct request ids and the
+--- reply notification matter: that is what `client.requests` tracks, and the word trigger reads it.
 local function faux_server(dispatch)
+  local next_id = 0
   return {
-    request = function(method, _, callback)
+    request = function(method, _, callback, notify_reply)
+      next_id = next_id + 1
+      local id = next_id
+      local function reply(result)
+        if notify_reply then notify_reply(id) end
+        callback(nil, result, id)
+      end
       if method == 'initialize' then
-        callback(nil, { capabilities = { completionProvider = { triggerCharacters = { '.' } } } })
+        reply({ capabilities = { completionProvider = { triggerCharacters = { '.' } } } })
       elseif method == 'textDocument/completion' then
         local line = vim.api.nvim_get_current_line()
         requests[#requests + 1] = line
         local from = vim.fn.match(line, '[[:alnum:].]*$')
         local range = { start = { line = 0, character = from }, ['end'] = { line = 0, character = #line } }
-        callback(nil, {
+        local result = {
           isIncomplete = true,
           items = {
             { label = 'util', filterText = 'java.util', textEdit = { range = range, newText = 'java.util' } },
             { label = 'time', filterText = 'java.time', textEdit = { range = range, newText = 'java.time' } },
           },
-        })
+        }
+        if faux_latency > 0 then
+          vim.defer_fn(function() reply(result) end, faux_latency)
+        else
+          reply(result)
+        end
       elseif method == 'shutdown' then
-        callback(nil, nil)
+        reply(nil)
       end
-      return true, 1
+      return true, id
     end,
     notify = function(method)
+      if method == '$/cancelRequest' then cancels = cancels + 1 end
       if method == 'exit' then dispatch.on_exit(0, 0) end
       return true
     end,
@@ -483,9 +499,10 @@ else
   check('letters alone send no request', #requests == 0, vim.inspect(requests))
 
   client.setup_word_triggers(lsp_client, lsp_buf, { completion_delay = 20 })
+  -- The built-in never re-reads this set for a client it already knows, and a later buffer would
+  -- turn every letter into a second, undebounced request path. So it is left as the server sent it.
   local triggers = lsp_client.server_capabilities.completionProvider.triggerCharacters
-  check('word chars become triggers', vim.tbl_contains(triggers, 'u'), vim.inspect(triggers))
-  check("server's own '.' is kept", vim.tbl_contains(triggers, '.'), vim.inspect(triggers))
+  check("server's trigger set is left alone", vim.deep_equal(triggers, { '.' }), vim.inspect(triggers))
 
   -- `<C-r>=` pumps the debounce timer without leaving insert mode; `feedkeys` with 'x' would drop
   -- to normal mode first, and the callback deliberately bails outside insert.
@@ -510,6 +527,37 @@ else
   requests = {}
   vim.api.nvim_feedkeys(vim.keycode('ccbar<C-r>=v:lua._units_pump()<CR><Esc>'), 'tx', false)
   check('a bare identifier requests completion', #requests > 0, vim.inspect(requests))
+
+  -- Regression: a server slower than the typing. `vim.lsp.completion.get` cancels whatever is in
+  -- flight, so a debounce firing between keystrokes restarted the request on every letter and the
+  -- menu could not appear until typing stopped. The in-flight request has to be left alone, and
+  -- one fresh request has to follow once its reply is in.
+  faux_latency = 150
+  requests, cancels = {}, 0
+  local pum_on_stale_reply
+  _G._units_pump_short = function()
+    vim.wait(40) -- past the 20 ms debounce, well inside the 150 ms reply
+    return ''
+  end
+  _G._units_pump_long = function()
+    -- The `.` reply lands first, with the whole word already typed.
+    vim.wait(400, function() return vim.fn.pumvisible() ~= 0 end, 10)
+    pum_on_stale_reply = vim.fn.pumvisible()
+    -- Then let the catch-up request be answered before <Esc>, whose InsertLeave cancels whatever is
+    -- still pending and would count as a cancel here.
+    vim.wait(400, function() return #requests >= 2 end, 10)
+    vim.wait(faux_latency + 100)
+    return ''
+  end
+  vim.api.nvim_feedkeys(vim.keycode(
+    'ccimport java.<C-r>=v:lua._units_pump_short()<CR>u<C-r>=v:lua._units_pump_short()<CR>' ..
+    't<C-r>=v:lua._units_pump_short()<CR>i<C-r>=v:lua._units_pump_long()<CR><Esc>'), 'tx', false)
+  check('a slow in-flight request is not cancelled by further typing', cancels == 0, cancels)
+  -- One for the `.`, left to land while `uti` is typed; then exactly one catch-up for `uti`.
+  check('one catch-up request after the stale reply, not one per letter',
+    #requests == 2 and requests[2] == 'import java.uti', vim.inspect(requests))
+  check('menu opens from the stale reply, before the catch-up answers', pum_on_stale_reply == 1, pum_on_stale_reply)
+  faux_latency = 0
 
   vim.lsp.stop_client(client_id, true)
 end

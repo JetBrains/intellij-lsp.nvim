@@ -96,8 +96,9 @@ word_triggers
     Default: true.
 
 completion_delay
-    Debounce in ms before a word-triggered completion request.
-    Default: 100.
+    Milliseconds after the first letter of a word before completion is
+    requested. The reply opens the menu while you keep typing; a request
+    already in flight is never cancelled by further keystrokes. Default: 100.
 
 enter_accepts_completion
     Map <CR> to accept the selected completion. Default: true.

@@ -84,7 +84,7 @@ require('intellij-lsp').setup({
   autotrigger = true,             -- open the completion menu on "."
   completeopt = nil,              -- add menuone,fuzzy,noinsert to 'completeopt'; false keeps yours
   word_triggers = true,           -- also request completion while typing identifiers
-  completion_delay = 100,         -- debounce in ms before a word-triggered request
+  completion_delay = 100,         -- ms after the first letter of a word before asking the server
   enter_accepts_completion = true, -- <CR> accepts the selected completion
 
   -- Editor ------------------------------------------------------------------

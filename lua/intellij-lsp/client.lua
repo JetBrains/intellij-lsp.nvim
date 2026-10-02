@@ -355,18 +355,6 @@ function M.setup_completeopt(cfg)
   vim.opt.completeopt:append('noinsert')
 end
 
---- Characters that reopen the completion menu, on top of the server's own `.`.
----
---- Letters, digits and `_`; enough to cover Java and Kotlin identifiers. `$` is deliberately left
---- out: it is legal in identifiers but overwhelmingly appears in strings and generated names.
-local WORD_TRIGGERS = (function()
-  local chars = { '_' }
-  for c = ('a'):byte(), ('z'):byte() do chars[#chars + 1] = string.char(c) end
-  for c = ('A'):byte(), ('Z'):byte() do chars[#chars + 1] = string.char(c) end
-  for c = ('0'):byte(), ('9'):byte() do chars[#chars + 1] = string.char(c) end
-  return chars
-end)()
-
 --- Requests completion while typing a word, not only after `.`.
 ---
 --- The server advertises `.` as its sole trigger character, and Neovim's `autotrigger` fires a
@@ -379,12 +367,21 @@ end)()
 --- * Completion on a bare identifier (a local variable, a method in scope) never triggers at all,
 ---   since nothing there follows a `.`.
 ---
---- Registering the word characters as trigger characters fixes both. This is a client-side view of
---- the trigger set — `vim.lsp.completion` reads it from the client object, so extending it here
---- changes when Neovim asks, not what the server supports.
+--- An InsertCharPre handler of our own on the word characters fixes both: `completion_delay` ms
+--- after the first letter of a word, `vim.lsp.completion.get()`. The server's trigger set is left
+--- alone on purpose: the built-in's `enable` does not re-read trigger characters for a client it
+--- already knows, so adding letters to it did nothing for the first buffer and gave every later
+--- buffer a *second*, undelayed 25 ms request path on each letter, racing this one.
 ---
---- The request is debounced: `vim.lsp.completion.get` is not free, and IntelliJ's completion is
---- heavy enough that firing on literally every keystroke is noticeable.
+--- Never cancel a completion request that is already in flight. `vim.lsp.completion.get` cancels
+--- whatever is pending before it asks again, so asking on every keystroke restarts the server's
+--- work each time, and whenever the server's latency exceeds the time between two keystrokes the
+--- menu cannot appear until typing stops — which on a large project is several seconds of nothing,
+--- then a menu. Instead the in-flight request is left to land: the built-in filters the response
+--- against the prefix *at response time*, so a reply computed for `fi` still shows the right subset
+--- for `find`, and a bigger prefix only ever narrows an identifier list. If keystrokes arrived
+--- meanwhile, one fresh request follows once the reply is in (a no-op when the menu is up with a
+--- complete list; a refetch when the list was capped by the server's 25-item limit).
 --- @param client vim.lsp.Client
 --- @param bufnr integer
 --- @param cfg table
@@ -392,35 +389,62 @@ function M.setup_word_triggers(client, bufnr, cfg)
   local provider = client.server_capabilities and client.server_capabilities.completionProvider
   if not provider then return end
 
-  local triggers = vim.list_extend({}, provider.triggerCharacters or {})
-  local present = {}
-  for _, c in ipairs(triggers) do present[c] = true end
-  for _, c in ipairs(WORD_TRIGGERS) do
-    if not present[c] then triggers[#triggers + 1] = c end
-  end
-  provider.triggerCharacters = triggers
-
-  -- `vim.lsp.completion.enable` snapshots the trigger characters when it runs, so re-enable to pick
-  -- up the extended set.
-  vim.lsp.completion.enable(true, client.id, bufnr, { autotrigger = true })
-
-  -- Suppress the menu right after an accepted completion: `CompleteDone` is followed by whatever the
-  -- server inserted, and re-triggering there fights the insertion.
   local delay = cfg.completion_delay or 100
   local timer
+  -- A keystroke arrived while a request was pending; ask again when that one lands.
+  local retrigger = false
+  local group = vim.api.nvim_create_augroup('IntellijLspWordTrigger' .. bufnr, { clear = true })
+
+  local function completion_in_flight()
+    for _, r in pairs(client.requests) do
+      if r.type == 'pending' and r.method == 'textDocument/completion' and r.bufnr == bufnr then
+        return true
+      end
+    end
+    return false
+  end
+
+  local function request()
+    retrigger = false
+    if vim.api.nvim_get_current_buf() ~= bufnr or vim.fn.mode():sub(1, 1) ~= 'i' then return end
+    if completion_in_flight() then
+      retrigger = true
+      return
+    end
+    vim.lsp.completion.get()
+  end
+
   vim.api.nvim_create_autocmd('InsertCharPre', {
-    group = vim.api.nvim_create_augroup('IntellijLspWordTrigger' .. bufnr, { clear = true }),
+    group = group,
     buffer = bufnr,
     desc = 'IntelliJ: keep the completion menu fed while typing a word',
     callback = function()
       if vim.fn.pumvisible() ~= 0 then return end
       if not vim.v.char:match('[%w_]') then return end
-      if timer then timer:stop() end
+      -- A delay, not a debounce. Restarting the timer on every keystroke means anyone typing faster
+      -- than `delay` sends nothing for the whole word and then waits the delay plus a full round
+      -- trip; letting the first timer run sends one request with whatever prefix exists by then,
+      -- and the reply opens the menu while the rest of the word is still being typed.
+      if timer then return end
       timer = vim.defer_fn(function()
-        if vim.api.nvim_get_current_buf() == bufnr and vim.fn.mode():sub(1, 1) == 'i' then
-          vim.lsp.completion.get()
-        end
+        timer = nil
+        request()
       end, delay)
+    end,
+  })
+
+  -- `complete` is fired for every reply, including the reply to a request cancelled by the built-in's
+  -- own `.` trigger. The in-flight check keeps this from cancelling that newer request in turn.
+  vim.api.nvim_create_autocmd('LspRequest', {
+    group = group,
+    buffer = bufnr,
+    desc = 'IntelliJ: re-request completion once a stale reply is in',
+    callback = function(ev)
+      local r = ev.data.request
+      if ev.data.client_id ~= client.id or r.method ~= 'textDocument/completion' then return end
+      if r.type ~= 'complete' or not retrigger then return end
+      -- After the reply's own handler has run, so `pumvisible()` reflects it.
+      vim.schedule(request)
     end,
   })
 end

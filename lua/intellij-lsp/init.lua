@@ -40,7 +40,9 @@ local M = {}
 ---                                 keeps the menu alive as you type and what completes plain
 ---                                 identifiers such as locals in scope
 --- @field completion_delay integer|nil
----                                 debounce in ms before a word-triggered request (default 100)
+---                                 ms after the first letter of a word before completion is
+---                                 requested; the reply opens the menu while you keep typing
+---                                 (default 100)
 --- @field references boolean|nil   `grr` opens a quickfix list that live-previews the selected
 ---                                 reference in the editor window (default true); false keeps
 ---                                 Neovim's built-in `grr`
