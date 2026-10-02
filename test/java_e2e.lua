@@ -242,6 +242,33 @@ else
   note('no String usage in Main.java; JDK-row check skipped')
 end
 
+-- Definition into the JDK through Neovim's own handler, which sets the cursor to the location's
+-- line as soon as the jar:/jrt: buffer is in the window. The String declaration sits deep inside
+-- src.zip's String.java, so this only passes when the BufReadCmd filled the buffer synchronously;
+-- the asynchronous placeholder failed here with "Invalid cursor line: out of range".
+if sline then
+  -- Not `:edit`: reloading the buffer detaches the client until the next FileType round-trip, and
+  -- `vim.lsp.buf.definition` only asks clients attached to the buffer right now.
+  vim.api.nvim_set_current_buf(mbuf)
+  vim.wait(10000, function() return vim.lsp.get_clients({ bufnr = mbuf, name = 'intellij' })[1] ~= nil end, 100)
+  vim.api.nvim_win_set_cursor(0, { sline + 1, scol })
+  vim.lsp.buf.definition()
+  local jumped = vim.wait(30000, function() return vim.api.nvim_get_current_buf() ~= mbuf end, 50)
+  vim.wait(200)
+  local jbuf = vim.api.nvim_get_current_buf()
+  local jname = vim.api.nvim_buf_get_name(jbuf)
+  check('definition of String opens a library buffer',
+    jumped and (jname:find('jar:', 1, true) or jname:find('jrt:', 1, true)) ~= nil, jname)
+  if jumped then
+    check('library buffer holds the source, not a placeholder',
+      vim.api.nvim_buf_line_count(jbuf) > 2, vim.api.nvim_buf_line_count(jbuf))
+    -- The failed cursor move leaves you on line 1; the declaration is what the server pointed at.
+    check('cursor sits on the String declaration',
+      vim.api.nvim_get_current_line():find('class String', 1, true) ~= nil, vim.api.nvim_get_current_line())
+    note('String resolved to ' .. jname .. ':' .. vim.api.nvim_win_get_cursor(0)[1])
+  end
+end
+
 -- back to Main.java for the remaining buffer-relative checks
 vim.cmd('edit ' .. MAIN)
 bufnr = vim.api.nvim_get_current_buf()

@@ -785,6 +785,42 @@ for _, case in ipairs({
   check(case.name .. ' buffer is a scratch', vim.bo.buftype == 'nofile' and not vim.bo.modifiable)
 end
 
+-- Regression: `vim.lsp.buf.definition` sets the cursor to the location's line the moment
+-- `nvim_win_set_buf` returns, and `locations_to_items` reads lines straight after bufloading a
+-- non-file URI. Both presuppose the BufReadCmd filled the buffer before returning. A `String`
+-- definition lands at line 173 of src.zip's String.java; against the two-line "decompiling..."
+-- placeholder that was "Invalid cursor line: out of range". The fake server answers on a timer, the
+-- way a real reply arrives, so this fails if the read goes back to being asynchronous.
+do
+  local source = {}
+  for i = 1, 200 do source[i] = ('line %d'):format(i) end
+  local fake_decompile_client = {
+    name = 'intellij',
+    request = function(_, method, params, handler)
+      check('decompile goes through executeCommand', method == 'workspace/executeCommand', method)
+      check('decompile names its command', params.command == 'decompile', params.command)
+      vim.defer_fn(function()
+        handler(nil, { code = table.concat(source, '\n'), language = 'java' })
+      end, 20)
+      return true, 1
+    end,
+  }
+  local real_get_clients = vim.lsp.get_clients
+  vim.lsp.get_clients = function(filter)
+    if filter and filter.name == 'intellij' then return { fake_decompile_client } end
+    return real_get_clients(filter)
+  end
+
+  vim.cmd('silent! edit ' .. vim.fn.fnameescape('jrt:/java.base/java/lang/Deep.class'))
+  check('decompiled source is in the buffer when :edit returns',
+    vim.api.nvim_buf_line_count(0) == 200, vim.api.nvim_buf_line_count(0))
+  check('decompiled buffer gets the server language as filetype', vim.bo.filetype == 'java', vim.bo.filetype)
+  local ok_cursor = pcall(vim.api.nvim_win_set_cursor, 0, { 173, 0 })
+  check('the definition handler can place the cursor deep in the source', ok_cursor)
+
+  vim.lsp.get_clients = real_get_clients
+end
+
 do -- scoped: Lua allows 200 locals per chunk
 -- ---------------------------------------------------------------------------
 -- intellij/ extension notifications

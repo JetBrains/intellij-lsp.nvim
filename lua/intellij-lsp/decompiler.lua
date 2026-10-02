@@ -12,11 +12,26 @@
 --- The URI is passed back exactly as the server sent it. A `jar:` URI carries a nested `file:///` and
 --- a `!/` separator, and round-tripping that through `vim.uri_to_fname` mangles it into a relative
 --- path under cwd -- the same phantom-buffer bug references.lua documents.
+---
+--- The source is requested *synchronously*. `BufReadCmd` replaces a file read, and Neovim's LSP code
+--- treats it as one: `vim.lsp.util.locations_to_items` bufloads a non-`file:` URI expressly so a
+--- plugin's BufReadCmd can fill it, and reads the lines back on the next statement; the definition
+--- handler then `nvim_win_set_cursor`s to the location's line. A placeholder filled while the real
+--- request is in flight has two lines, so a JDK jump -- `String` resolves to line 173 of the
+--- `src.zip` source, not to `0:0` of a class file -- failed with "Invalid cursor line: out of range"
+--- and left you at line 1 once the source arrived. Blocking for the decompile is what makes the
+--- cursor land; the cache means it happens once per class. The async placeholder path is kept only
+--- for a request that outlives the timeout.
 
 local M = {}
 
 local COMMAND = 'decompile'
 local SCHEMES = { jar = true, jrt = true }
+
+--- How long a `BufReadCmd` waits for the server before falling back to the placeholder. Reading a
+--- source from `src.zip` and decompiling a class file both measured well under 50 ms against a
+--- warm server; the bound is for a stalled one, and `vim.wait` gives up early on `<C-c>`.
+local SYNC_TIMEOUT_MS = 10000
 
 --- Decompiled text per URI, so reopening a class does not re-request it.
 --- @type table<string, string[]>
@@ -86,31 +101,46 @@ function M.load(bufnr, uri)
     return
   end
 
-  -- Placeholder while the request is in flight: opening a class in a large jar is not instant, and
-  -- an empty buffer is exactly the symptom this module exists to remove.
+  local function on_result(err, result)
+    if err or not result or not result.code then
+      fill(bufnr, {
+        '// IntelliJ LSP: could not decompile this file',
+        '// ' .. uri,
+        err and ('// ' .. tostring(err.message or err)) or nil,
+      }, nil)
+      return
+    end
+
+    local entry = {
+      lines = vim.split(result.code, '\n', { plain = true }),
+      -- The server reports IntelliJ's own lowercased language id ("java", "kotlin"), which
+      -- matches Neovim's filetype names for both languages this client serves.
+      filetype = result.language,
+    }
+    cache[uri] = entry
+    fill(bufnr, entry.lines, entry.filetype)
+  end
+
+  -- One request, waited on synchronously (see the header). Not `request_sync`: that cancels on
+  -- timeout, and re-requesting would make the server start the decompile over. Here the same
+  -- handler fills the buffer whether it lands inside the wait or after it.
+  local done = false
+  local sent = client:request('workspace/executeCommand', { command = COMMAND, arguments = { uri } },
+    function(err, result)
+      done = true
+      on_result(err, result)
+    end, bufnr)
+  if not sent then
+    on_result({ message = 'request could not be sent' }, nil)
+    return
+  end
+
+  vim.wait(SYNC_TIMEOUT_MS, function() return done end, 10)
+  if done then return end
+
+  -- Placeholder while the request is still in flight: a slow decompile is better shown late than
+  -- never, and an empty buffer is exactly the symptom this module exists to remove.
   fill(bufnr, { '// IntelliJ LSP: decompiling...', '// ' .. uri }, nil)
-
-  client:exec_cmd({ command = COMMAND, arguments = { uri } }, { bufnr = bufnr }, function(err, result)
-    vim.schedule(function()
-      if err or not result or not result.code then
-        fill(bufnr, {
-          '// IntelliJ LSP: could not decompile this file',
-          '// ' .. uri,
-          err and ('// ' .. tostring(err.message or err)) or nil,
-        }, nil)
-        return
-      end
-
-      local entry = {
-        lines = vim.split(result.code, '\n', { plain = true }),
-        -- The server reports IntelliJ's own lowercased language id ("java", "kotlin"), which
-        -- matches Neovim's filetype names for both languages this client serves.
-        filetype = result.language,
-      }
-      cache[uri] = entry
-      fill(bufnr, entry.lines, entry.filetype)
-    end)
-  end)
 end
 
 --- Registers the `BufReadCmd` that turns a jar:/jrt: buffer into decompiled source.
