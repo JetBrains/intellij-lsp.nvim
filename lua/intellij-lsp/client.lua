@@ -44,7 +44,81 @@ M.BUILD_FILE_MARKERS = {
   'MODULE.bazel',
 }
 
---- Nearest ancestor directory containing a project marker.
+local GRADLE_SETTINGS = { 'settings.gradle', 'settings.gradle.kts' }
+local GRADLE_BUILD = { 'build.gradle', 'build.gradle.kts' }
+
+--- @param dir string
+--- @param names string[]
+--- @return boolean
+local function has_any(dir, names)
+  for _, name in ipairs(names) do
+    if vim.uv.fs_stat(dir .. '/' .. name) then return true end
+  end
+  return false
+end
+
+--- Directories that `dir/pom.xml` aggregates, as a set of normalized absolute paths.
+---
+--- Reads `<module>` (Maven 3) and `<subproject>` (Maven 4) entries with a text match rather than an
+--- XML parser, after stripping comments so a commented-out module does not count. Entries inside
+--- `<profiles>` count too: a profile module is still part of the build the user would open. An entry
+--- may name the module's pom file instead of its directory, which resolves to the same directory.
+--- @param dir string
+--- @return table<string, true>
+local function pom_modules(dir)
+  local modules = {}
+  local fd = io.open(dir .. '/pom.xml', 'r')
+  if not fd then return modules end
+  local text = fd:read('*a'):gsub('<!%-%-.-%-%->', '')
+  fd:close()
+  for _, tag in ipairs({ 'module', 'subproject' }) do
+    for entry in text:gmatch('<' .. tag .. '>%s*(.-)%s*</' .. tag .. '>') do
+      local path = vim.fs.normalize(dir .. '/' .. entry)
+      if path:match('%.xml$') then path = vim.fs.dirname(path) end
+      modules[path] = true
+    end
+  end
+  return modules
+end
+
+--- Widens a directory holding a build file to the root of the build it belongs to.
+---
+--- The nearest build file is often one module of a larger build, and imported on its own a module
+--- cannot resolve its siblings: in antonarhipov/school-kernel, `kernel-cli` alone fails the Maven
+--- import on `kernel-contract:1.0.0-SNAPSHOT`, which leaves no classpath and no completion.
+---
+---   * Gradle: the nearest `settings.gradle(.kts)` at or above `dir`, which is how Gradle itself
+---     finds the build root. A `build.gradle` with no settings file above is its own build.
+---   * Maven: climb while an ancestor's `pom.xml` lists the current root as a module. A `pom.xml`
+---     nothing lists (an example project, a test fixture) stays a project of its own. `.mvn/` is not
+---     used as a shortcut: it marks where Maven reads its config, not which modules form a build.
+---   * Bazel's `MODULE.bazel` and the `.git` fallback are roots already.
+--- @param dir string
+--- @return string
+function M.build_root(dir)
+  dir = vim.fs.normalize(dir)
+  if has_any(dir, GRADLE_SETTINGS) then return dir end
+
+  if vim.uv.fs_stat(dir .. '/pom.xml') then
+    local root = dir
+    for parent in vim.fs.parents(dir) do
+      if pom_modules(parent)[root] then root = parent end
+    end
+    return root
+  end
+
+  if has_any(dir, GRADLE_BUILD) then
+    -- Stop below the home directory: a stray `~/settings.gradle` must not swallow every project.
+    local settings = vim.fs.find(GRADLE_SETTINGS,
+      { path = dir, upward = true, type = 'file', stop = vim.uv.os_homedir() })[1]
+    return settings and vim.fs.dirname(settings) or dir
+  end
+
+  return dir
+end
+
+--- Root of the build that the buffer's file belongs to: the nearest project marker, widened by
+--- `build_root` from a module to the build that aggregates it.
 --- @param bufnr integer
 --- @return string|nil
 function M.find_root(bufnr)
@@ -52,7 +126,7 @@ function M.find_root(bufnr)
   if name == '' then return nil end
   local start = vim.fs.dirname(name)
   local marker = vim.fs.find(M.ROOT_MARKERS, { path = start, upward = true })[1]
-  return marker and vim.fs.dirname(marker) or nil
+  return marker and M.build_root(vim.fs.dirname(marker)) or nil
 end
 
 --- Whether `dir` is `path` or contains it.
@@ -86,14 +160,15 @@ M._contains = contains
 --- whole class.
 ---
 --- The cost: `nvim` in the parent of a single checkout, or in a monorepo whose build files sit only in
---- subdirectories, does not start the import until a source file is opened, and the per-buffer path
---- then roots on the file's nearest marker (which may be one module of a multi-module build).
+--- subdirectories, does not start the import until a source file is opened. Upward-only does not
+--- mean module-only, though: the marker found is widened by `build_root`, so `nvim` inside a module
+--- of a multi-module build still starts on the whole build.
 --- @param cwd string
 --- @return string|nil root_dir
 function M.find_build_root(cwd)
   cwd = vim.fs.normalize(cwd)
   local marker = vim.fs.find(M.BUILD_FILE_MARKERS, { path = cwd, upward = true, type = 'file' })[1]
-  return marker and vim.fs.dirname(marker) or nil
+  return marker and M.build_root(vim.fs.dirname(marker)) or nil
 end
 
 --- An already-running client of ours whose root contains `path`.

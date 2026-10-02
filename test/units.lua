@@ -243,6 +243,65 @@ check('an unrelated file does not activate',
   client.find_build_root(fixture({ 'README.md', 'sub/Cargo.toml' })) == nil)
 
 -- ---------------------------------------------------------------------------
+-- A module widens to the build that aggregates it
+-- ---------------------------------------------------------------------------
+-- Regression: rooted at its nearest pom.xml, a module of antonarhipov/school-kernel was imported on
+-- its own, could not resolve its sibling SNAPSHOT module, and so had no classpath at all.
+local function pom(dir, path, body)
+  vim.fn.writefile({ '<project>', body, '</project>' }, dir .. '/' .. path)
+end
+
+local reactor = fixture({ 'pom.xml', 'kernel-cli/pom.xml', 'kernel-cli/src/main/java/A.java',
+  'examples/demo/pom.xml', 'appstore/pom.xml' })
+pom(reactor, 'pom.xml', '<modules><module>kernel-contract</module><module>kernel-cli</module>'
+  .. '<module>app</module></modules>')
+check('a listed maven module widens to its reactor',
+  client.build_root(reactor .. '/kernel-cli') == reactor, client.build_root(reactor .. '/kernel-cli'))
+check('find_build_root widens from inside a module',
+  client.find_build_root(reactor .. '/kernel-cli/src/main/java') == reactor)
+local reactor_buf = vim.fn.bufadd(reactor .. '/kernel-cli/src/main/java/A.java')
+check('find_root widens a module file to its reactor', client.find_root(reactor_buf) == reactor,
+  tostring(client.find_root(reactor_buf)))
+check('a pom nothing lists stays its own project',
+  client.build_root(reactor .. '/examples/demo') == reactor .. '/examples/demo')
+check('a module name is not a prefix match',
+  client.build_root(reactor .. '/appstore') == reactor .. '/appstore')
+check('the reactor itself stays put', client.build_root(reactor) == reactor)
+
+local chain = fixture({ 'pom.xml', 'a/pom.xml', 'a/b/pom.xml' })
+pom(chain, 'pom.xml', '<modules><module>a</module></modules>')
+pom(chain, 'a/pom.xml', '<modules><module>b</module></modules>')
+check('nested aggregators widen to the outermost', client.build_root(chain .. '/a/b') == chain)
+
+local deep = fixture({ 'pom.xml', 'services/api/pom.xml' })
+pom(deep, 'pom.xml', '<modules>\n  <module>./services/api/</module>\n</modules>')
+check('a module path through a pom-less directory widens',
+  client.build_root(deep .. '/services/api') == deep)
+
+local by_file = fixture({ 'pom.xml', 'app/pom.xml' })
+pom(by_file, 'pom.xml', '<modules><module>app/pom.xml</module></modules>')
+check('a module named by its pom file widens', client.build_root(by_file .. '/app') == by_file)
+
+local maven4 = fixture({ 'pom.xml', 'app/pom.xml' })
+pom(maven4, 'pom.xml', '<subprojects><subproject>app</subproject></subprojects>')
+check('a maven 4 subproject widens', client.build_root(maven4 .. '/app') == maven4)
+
+local commented = fixture({ 'pom.xml', 'app/pom.xml' })
+pom(commented, 'pom.xml', '<modules><!-- <module>app</module> --></modules>')
+check('a commented-out module does not widen',
+  client.build_root(commented .. '/app') == commented .. '/app')
+
+local gradle_multi = fixture({ 'settings.gradle.kts', 'build.gradle.kts', 'app/build.gradle.kts' })
+check('a gradle subproject widens to its settings file',
+  client.build_root(gradle_multi .. '/app') == gradle_multi)
+local gradle_single = fixture({ 'build.gradle' })
+check('a gradle build with no settings stays put',
+  client.build_root(gradle_single) == gradle_single)
+local gradle_included = fixture({ 'settings.gradle', 'tools/settings.gradle', 'tools/build.gradle' })
+check('the nearest gradle settings wins',
+  client.build_root(gradle_included .. '/tools') == gradle_included .. '/tools')
+
+-- ---------------------------------------------------------------------------
 -- Shared directories decline the eager start
 -- ---------------------------------------------------------------------------
 -- A stray build file dropped directly into a shared directory would make that directory the root and

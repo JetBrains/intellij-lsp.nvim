@@ -115,9 +115,9 @@ end
 ---
 --- The ancestor check is not an optimization. `vim.lsp.start` only reuses a client whose workspace
 --- folder URIs match *exactly*, while eager activation roots the server at the working directory and
---- `find_root` walks up from the file -- so in a multi-module build the two disagree (`cwd` vs.
---- `cwd/app`) and `vim.lsp.start` would start a second server on the same project, importing and
---- indexing it twice.
+--- `find_root` walks up from the file -- so the two can disagree (`cwd` vs. `cwd/app`, for a module
+--- the parent build does not list) and `vim.lsp.start` would start a second server on the same
+--- project, importing and indexing it twice.
 --- @param bufnr integer
 local function start_for_buffer(bufnr)
   if vim.b[bufnr].intellij_lsp_attached then return end
