@@ -10,11 +10,14 @@ JetBrains product with its own license (`EULA.txt` inside the bundle), which you
 
 ## Project status
 
-⚠️ **This project is in alpha.** ⚠️
+⚠️ **This project is in pre-alpha.** ⚠️
 
 Expect rough edges: features may be incomplete or broken, and configuration options, commands and
 key mappings can change between releases without a deprecation period. Please report what breaks,
 but do not depend on it for daily work yet.
+
+At this stage we can't make promises about the roadmap or the pace of development, so features and
+release timing may shift as the project evolves.
 
 ## Quick start
 
