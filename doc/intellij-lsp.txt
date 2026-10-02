@@ -105,7 +105,9 @@ enter_accepts_completion
 
 references
     `grr` opens a quickfix list that live-previews the selected reference.
-    Default: true.
+    References inside libraries and the JDK are rows like any other and
+    preview as decompiled source when `decompiler` is on; with it off they
+    are listed but cannot be opened. Default: true.
 
 inlay_hints
     Show parameter and type hints. Default: true.

@@ -60,28 +60,30 @@ vim.api.nvim_create_autocmd('ColorScheme', {
 })
 
 -- -------------------------------------------------------------------------------------------------
--- Pure helpers (exposed as M._* for the server-free test suite)
+-- Row helpers (exposed as M._* for the server-free test suite)
 -- -------------------------------------------------------------------------------------------------
 
---- True for a location this client cannot open.
+--- True for a location inside a library or the JDK.
 ---
---- The server answers references inside libraries and the JDK with `jar:` and `jrt:` URIs.
---- decompiler.lua can open one of those on demand, but not *here*: quickfix resolves an item to a
---- buffer eagerly, so listing them as navigable would spawn a decompile request per row the moment
---- the list opens. They stay excluded from the previewing list; `gd` onto a library symbol reaches
---- the same source.
+--- The server answers those with `jar:` and `jrt:` URIs. By the time on_list runs, Neovim has
+--- already turned each one into a buffer: `vim.lsp.util.locations_to_items` calls `vim.uri_to_bufnr`
+--- on every URI. What it does next depends on the scheme, and inconsistently so. A `jrt:` name looks
+--- absolute, so get_lines sees a non-`file:` URI and `bufload`s it expressly so a plugin's BufReadCmd
+--- can fill it -- decompiler.lua's does -- and the item arrives with real text. A `jar:` URI is
+--- treated as a *relative path under cwd*, the buffer is literally named "<cwd>/jar:file:///...",
+--- and reading that name back yields a `file:` URI, so get_lines tries the filesystem instead, finds
+--- nothing, and the item arrives with empty text and columns clamped to 1.
 ---
---- This is not merely cosmetic filtering. By the time on_list runs, `vim.lsp.util.locations_to_items`
---- has already called `vim.uri_to_bufnr` on every URI, and for a `jar:` URI that resolves to a
---- *relative path under cwd*: a buffer literally named "<cwd>/jar:file:///...". Those buffers exist
---- whether we filter or not, which is why wipe_external_buffers() below has to run regardless.
+--- hydrate() below evens that out: it loads the buffer itself where Neovim did not and recomputes the
+--- row from the Location's range. Either way the row is pinned to the buffer by number -- handing
+--- quickfix the cwd-prefixed name as a `filename` would only resolve it a second time.
 --- @param uri string
 --- @return boolean
 local function is_external(uri)
   return uri:sub(1, 5) ~= 'file:'
 end
 
---- The recognisable tail of a `jar:`/`jrt:` URI, for a row whose real text came back empty.
+--- The recognisable tail of a `jar:`/`jrt:` URI, for a row whose text came back empty.
 ---
 --- `jar:file:///.../lib.jar!/com/example/Foo.class` -> `lib.jar!/com/example/Foo.class`
 --- `jrt:/java.base/java/lang/String.class`          -> `java.base/java/lang/String.class`
@@ -127,31 +129,79 @@ local function qf_line_range(rendered, stored, col, end_col)
   return s, e
 end
 
---- Splits LSP list items into navigable and external, tagging the external ones for quickfix.
+--- Rebuilds a library row from its buffer, loading the buffer if Neovim did not.
 ---
---- External rows are kept rather than dropped. Silently filtering turns "17 references" into 4 with
---- no explanation, which is indistinguishable from the stale-index case the README warns about --
---- the most confusing failure mode this server has. `valid = 0` renders as a bare "|| text" row and
---- quickfix's own `:cnext`/`:cprev` skip such entries, so existing workflows stay correct for free.
+--- `bufload` is what runs decompiler.lua's BufReadCmd, which blocks until the source is in the
+--- buffer (its cache makes that once per class, not once per row). The line is then read back and
+--- the Location's utf-16 columns converted against it -- the conversion locations_to_items did was
+--- against whatever line it had, which for a `jar:` row was none.
+---
+--- Returns nil when there is still no line to show: the decompiler is disabled, no server is
+--- attached, or the scheme is one no BufReadCmd claims.
+--- @param item table item from on_list
+--- @param uri string
+--- @param encoding string the answering client's offset encoding
+--- @return table|nil row quickfix entry pinned to the buffer by number
+local function hydrate(item, uri, encoding)
+  local range = vim.tbl_get(item, 'user_data', 'range')
+    or vim.tbl_get(item, 'user_data', 'targetSelectionRange')
+    or vim.tbl_get(item, 'user_data', 'targetRange')
+  if not range then return nil end
+
+  local buf = vim.uri_to_bufnr(uri)
+  if not vim.api.nvim_buf_is_loaded(buf) then pcall(vim.fn.bufload, buf) end
+  if not vim.api.nvim_buf_is_loaded(buf) then return nil end
+
+  local line = vim.api.nvim_buf_get_lines(buf, range.start.line, range.start.line + 1, false)[1]
+  if not line or line == '' then return nil end
+
+  local function byte_col(pos)
+    local ok, idx = pcall(vim.str_byteindex, line, encoding, pos.character, false)
+    return (ok and idx or #line) + 1
+  end
+
+  local row = vim.deepcopy(item)
+  row.filename = nil
+  row.bufnr = buf
+  row.text = line
+  row.lnum = range.start.line + 1
+  row.end_lnum = range['end'].line + 1
+  row.col = byte_col(range.start)
+  -- A range that ends on a later line has no end column on this one; highlight_qf_row clamps on it.
+  row.end_col = range['end'].line == range.start.line and byte_col(range['end']) or nil
+  row.valid = 1
+  return row
+end
+
+--- Prepares LSP list items for quickfix, pinning library rows to their decompiled buffers.
+---
+--- A library row the decompiler can fill (see hydrate) is as navigable as any other: stepping onto it
+--- previews the decompiled source and <CR> lands in it.
+---
+--- One it cannot fill is kept rather than dropped: silently filtering turns "17 references" into 4
+--- with no explanation, indistinguishable from the stale-index case the README warns about.
+--- `valid = 0` renders as a bare "|| text" row that `:cnext`/`:cprev` skip, and the URI's tail
+--- stands in for the text it does not have.
 --- @param items table[] items from on_list
---- @return table[] tagged copy, external entries marked valid = 0
---- @return integer external_count
-local function tag_items(items)
-  local out, external = {}, 0
+--- @param encoding string|nil offset encoding of the client that answered; defaults to utf-16
+--- @return table[] prepared copy
+--- @return integer unopenable count of rows marked valid = 0
+local function tag_items(items, encoding)
+  encoding = encoding or 'utf-16'
+  local out, unopenable = {}, 0
 
   for _, item in ipairs(items) do
     local uri = vim.tbl_get(item, 'user_data', 'uri')
       or vim.tbl_get(item, 'user_data', 'targetUri')
 
     if uri and is_external(uri) then
-      external = external + 1
-      -- No filename: quickfix would resolve it against cwd, which is exactly the phantom-buffer bug.
-      -- The real `text` is "" (locations_to_items could not read the file), so it is synthesized.
-      table.insert(out, {
-        text = external_label(uri),
-        valid = 0,
-        user_data = item.user_data,
-      })
+      local row = hydrate(item, uri, encoding)
+      if not row then
+        unopenable = unopenable + 1
+        -- No filename and no bufnr: the empty buffer behind this row is wiped by the caller.
+        row = { text = external_label(uri), valid = 0, user_data = item.user_data }
+      end
+      table.insert(out, row)
     else
       local copy = vim.deepcopy(item)
       copy.valid = 1
@@ -159,7 +209,7 @@ local function tag_items(items)
     end
   end
 
-  return out, external
+  return out, unopenable
 end
 
 M._qf_line_range = qf_line_range
@@ -171,16 +221,22 @@ M._tag_items = tag_items
 -- Preview
 -- -------------------------------------------------------------------------------------------------
 
---- Wipes the buffers `locations_to_items` created for non-file URIs.
+--- Wipes the empty buffers behind the rows tag_items could not make navigable.
 ---
---- See is_external(): a `jar:` URI becomes a buffer named after the URI interpreted as a path under
---- cwd. They arrive unloaded and unmodified, so forcing is safe; wipe rather than delete so they
---- leave no listing behind at all.
-local function wipe_external_buffers()
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    local name = vim.api.nvim_buf_get_name(buf)
-    if name:find('jar:', 1, true) or name:find('jrt:', 1, true) then
-      pcall(vim.api.nvim_buf_delete, buf, { force = true, unload = false })
+--- Only those. The decompiled buffers behind navigable rows are what the list previews, and a blanket
+--- sweep over every `jar:`/`jrt:` name also caught the buffer `grr` was pressed in when that was a
+--- decompiled class -- leaving `q` with no origin to restore. `uri_to_bufnr` looks the buffer up by
+--- the same name locations_to_items gave it, so this never creates one; a buffer shown in a window is
+--- left alone because wiping it would yank that window somewhere else.
+--- @param items table[] prepared rows
+local function wipe_unopenable_buffers(items)
+  for _, item in ipairs(items) do
+    if item.valid == 0 then
+      local uri = vim.tbl_get(item, 'user_data', 'uri') or vim.tbl_get(item, 'user_data', 'targetUri')
+      local buf = uri and vim.uri_to_bufnr(uri)
+      if buf and vim.fn.bufwinid(buf) == -1 then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true, unload = false })
+      end
     end
   end
 end
@@ -298,7 +354,7 @@ end
 --- cursor and our extmarks all survive, and it costs ~2.5us on a 500-entry list, which is why it is
 --- affordable on every CursorMoved.
 ---
---- Invalid (jar:/jrt:) rows are skipped rather than selected. Quickfix's own :cnext refuses to land on
+--- Invalid (unopenable library) rows are skipped rather than selected. Quickfix's own :cnext refuses to land on
 --- them, so pointing idx at one would put the bar somewhere :cc could never go.
 --- @param idx integer 1-based quickfix index
 local function sync_qf_idx(idx)
@@ -459,10 +515,10 @@ function M.run(opts)
   -- utf-16 -> byte column conversion via vim.str_byteindex, which is easy to get wrong by hand.
   vim.lsp.buf.references({ includeDeclaration = include }, {
     on_list = function(list)
-      local items, external = tag_items(list.items or {})
+      -- The list does not say which client answered; with one server per buffer, the first is it.
+      local items, unopenable = tag_items(list.items or {}, clients[1].offset_encoding)
 
-      -- Must run whether or not anything was filtered: the phantom buffers already exist by now.
-      if external > 0 then wipe_external_buffers() end
+      if unopenable > 0 then wipe_unopenable_buffers(items) end
 
       if #items == 0 then
         vim.notify('IntelliJ LSP: no references found.', vim.log.levels.INFO)
@@ -495,11 +551,11 @@ function M.run(opts)
       highlight_qf_row(1)
       preview(state.items[1])
 
-      if external > 0 then
+      if unopenable > 0 then
         vim.schedule(function()
           vim.notify(
-            ('IntelliJ LSP: %d reference(s) in libraries/JDK are not listed here; open one with `gd` '
-              .. 'to read its decompiled source.'):format(external),
+            ('IntelliJ LSP: %d reference(s) in libraries/JDK could not be opened; enable '
+              .. '`decompiler` to browse them as source.'):format(unopenable),
             vim.log.levels.INFO
           )
         end)

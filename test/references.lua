@@ -83,38 +83,78 @@ check('external_label: jrt tail',
   refs._external_label('jrt:/java.base/java/lang/String.class') == 'java.base/java/lang/String.class',
   refs._external_label('jrt:/java.base/java/lang/String.class'))
 
-local tagged, external = refs._tag_items({
+-- Stands in for what locations_to_items leaves behind: a buffer per external URI, which the
+-- decompiler's BufReadCmd filled (the jar: row) or nothing did (the jrt: row). The jar: item carries
+-- the empty text and clamped columns Neovim really produces for that scheme (see is_external), so
+-- this checks that the row is rebuilt from the buffer rather than trusted.
+local JAR = 'jar:file:///l/lib.jar!/com/E.class'
+local jar_buf = vim.uri_to_bufnr(JAR)
+vim.fn.bufload(jar_buf)
+vim.api.nvim_buf_set_lines(jar_buf, 0, -1, false, { 'package com;', 'public class E {}' })
+local empty_buf = vim.uri_to_bufnr('jrt:/java.base/java/lang/String.class')
+
+local function rng(line, s, e)
+  return { start = { line = line, character = s }, ['end'] = { line = line, character = e } }
+end
+
+local tagged, unopenable = refs._tag_items({
   { filename = '/tmp/A.java', lnum = 1, col = 1, end_col = 6, text = 'class A',
-    user_data = { uri = 'file:///tmp/A.java' } },
+    user_data = { uri = 'file:///tmp/A.java', range = rng(0, 0, 5) } },
   { filename = '', lnum = 4, col = 1, end_col = 1, text = '',
-    user_data = { uri = 'jrt:/java.base/java/lang/String.class' } },
+    user_data = { uri = 'jrt:/java.base/java/lang/String.class', range = rng(3, 0, 5) } },
   { filename = '/tmp/B.java', lnum = 2, col = 1, end_col = 6, text = 'class B',
-    user_data = { uri = 'file:///tmp/B.java' } },
-})
-check('external counted', external == 1, external)
+    user_data = { uri = 'file:///tmp/B.java', range = rng(1, 0, 5) } },
+  { filename = vim.uri_to_fname(JAR), lnum = 2, col = 1, end_col = 1, text = '',
+    user_data = { uri = JAR, range = rng(1, 13, 14) } },
+}, 'utf-16')
+check('only the unfilled row counted as unopenable', unopenable == 1, unopenable)
 check('file items stay valid', tagged[1].valid == 1 and tagged[3].valid == 1)
-check('external item marked invalid', tagged[2].valid == 0, tagged[2].valid)
-check('external item has synthesized text', tagged[2].text ~= '' and tagged[2].text ~= nil,
+check('unfilled library item marked invalid', tagged[2].valid == 0, tagged[2].valid)
+check('unfilled library item has synthesized text', tagged[2].text ~= '' and tagged[2].text ~= nil,
   ('%q'):format(tostring(tagged[2].text)))
 -- No filename: quickfix would otherwise resolve it against cwd, which is the phantom-buffer bug.
-check('external item carries no filename', tagged[2].filename == nil, tagged[2].filename)
+check('unfilled library item carries no filename', tagged[2].filename == nil, tagged[2].filename)
 
--- Round-trip: valid=0 and the range columns have to survive quickfix, or the feature loses either its
--- skip-invalid behaviour or its extmarks.
+-- The decompiled row is navigable, and pinned to the buffer that already holds the source rather than
+-- re-resolved from the cwd-prefixed name.
+check('decompiled library item made valid', tagged[4].valid == 1, tagged[4].valid)
+check('decompiled library item reads its text from the buffer', tagged[4].text == 'public class E {}',
+  tagged[4].text)
+check('decompiled library item recomputes its columns', tagged[4].col == 14 and tagged[4].end_col == 15,
+  vim.inspect({ tagged[4].col, tagged[4].end_col }))
+check('decompiled library item pinned by bufnr', tagged[4].bufnr == jar_buf and tagged[4].filename == nil,
+  vim.inspect({ tagged[4].bufnr, jar_buf, tagged[4].filename }))
+
+-- Round-trip: valid=0, the bufnr and the range columns have to survive quickfix, or the feature loses
+-- its skip-invalid behaviour, its preview target or its extmarks.
 vim.fn.setqflist({}, ' ', { title = 'References', items = tagged })
 local got = vim.fn.getqflist()
 check('valid=0 survives setqflist', got[2].valid == 0, got[2].valid)
 check('end_col survives setqflist', got[1].end_col == 6, got[1].end_col)
+check('library bufnr survives setqflist', got[4].bufnr == jar_buf, got[4].bufnr)
 check('title survives', vim.fn.getqflist({ title = 0 }).title == 'References',
   vim.fn.getqflist({ title = 0 }).title)
 
--- Quickfix's own :cnext skips invalid entries, which is why external rows can be kept as rows.
+-- Quickfix's own :cnext skips invalid entries, which is why unopenable rows can be kept as rows.
 vim.fn.writefile({ 'class A', 'body' }, '/tmp/A.java')
 vim.fn.writefile({ 'class B', 'body' }, '/tmp/B.java')
 vim.cmd('cfirst')
 vim.cmd('cnext')
 check(':cnext skips the invalid row', vim.fn.getqflist({ idx = 0 }).idx == 3,
   vim.fn.getqflist({ idx = 0 }).idx)
+-- ...and lands on the decompiled row, in its buffer, on the referenced line.
+vim.cmd('cnext')
+check(':cnext reaches the decompiled row', vim.fn.getqflist({ idx = 0 }).idx == 4,
+  vim.fn.getqflist({ idx = 0 }).idx)
+check(':cc enters the decompiled buffer',
+  vim.api.nvim_get_current_buf() == jar_buf and vim.api.nvim_win_get_cursor(0)[1] == 2,
+  vim.inspect({ vim.api.nvim_get_current_buf(), vim.api.nvim_win_get_cursor(0) }))
+check('the unfilled buffer is left for the caller to wipe', vim.api.nvim_buf_is_valid(empty_buf))
+
+-- Clean slate for the end-to-end section, which asserts on which library buffers exist.
+for _, b in ipairs({ jar_buf, empty_buf }) do
+  pcall(vim.api.nvim_buf_delete, b, { force = true, unload = false })
+end
 
 -- -------------------------------------------------------------------------------------------------
 -- Preview state hygiene
@@ -206,6 +246,20 @@ local function loc(path, line)
   }
 end
 
+-- Stands in for decompiler.lua: fills a `jar:` buffer the way its BufReadCmd does, so the row behind
+-- it is navigable. The `jrt:` URI below is deliberately left unclaimed, so that row stays empty and
+-- exercises the fallback.
+local DECOMPILED = { 'package com;', 'public class E {', '    Greeter g = new Greeter();', '}' }
+vim.api.nvim_create_autocmd('BufReadCmd', {
+  group = vim.api.nvim_create_augroup('IntellijLspRefsFakeDecompiler', { clear = true }),
+  pattern = '*/jar:*',
+  callback = function(args)
+    vim.api.nvim_buf_set_lines(args.buf, 0, -1, false, DECOMPILED)
+    vim.bo[args.buf].modified = false
+    vim.bo[args.buf].buftype = 'nofile'
+  end,
+})
+
 vim.cmd('edit ' .. HYG .. '/A1.java')
 origin_win = vim.api.nvim_get_current_win()
 local origin_buf = vim.api.nvim_get_current_buf()
@@ -219,9 +273,13 @@ local cid = vim.lsp.start({
   cmd = fake_server({
     loc(HYG .. '/A1.java', 1),
     loc(HYG .. '/A2.java', 1),
-    -- A JDK reference, to prove the invalid row survives the round trip and is skipped.
+    -- A JDK reference nothing decompiles, to prove the invalid row survives the round trip and is
+    -- skipped.
     { uri = 'jrt:/java.base/java/lang/String.class',
       range = { start = { line = 3, character = 0 }, ['end'] = { line = 3, character = 5 } } },
+    -- A library reference the stand-in decompiler fills: a navigable row like any project file's.
+    { uri = JAR,
+      range = { start = { line = 2, character = 4 }, ['end'] = { line = 2, character = 11 } } },
   }),
   root_dir = HYG,
 }, { bufnr = 0 })
@@ -232,8 +290,25 @@ vim.wait(2000, function() return refs.is_open() end)
 check('session open after run()', refs.is_open() == true)
 
 local rows = vim.fn.getqflist()
-check('external rows are kept, not filtered', #rows == 3, #rows)
-check('the jrt row is invalid', rows[3].valid == 0, rows[3].valid)
+check('external rows are kept, not filtered', #rows == 4, #rows)
+-- locations_to_items sorts by URI, so the rows are looked up rather than indexed: `jar:` sorts
+-- before `jrt:`, and both after the file: rows only by accident of the /tmp path.
+local jar_idx, jrt_idx
+for i, r in ipairs(rows) do
+  local u = vim.tbl_get(r, 'user_data', 'uri') or ''
+  if u == JAR then jar_idx = i elseif u:find('^jrt:') then jrt_idx = i end
+end
+check('both library rows are present', jar_idx ~= nil and jrt_idx ~= nil, vim.inspect({ jar_idx, jrt_idx }))
+jar_idx, jrt_idx = jar_idx or 3, jrt_idx or 4
+local jar_row, jrt_row = rows[jar_idx], rows[jrt_idx]
+check('the jrt row is invalid', jrt_row.valid == 0, jrt_row.valid)
+check('the decompiled jar row is valid', jar_row.valid == 1, jar_row.valid)
+check('the decompiled jar row carries its source line',
+  jar_row.text == DECOMPILED[3], ('%q'):format(tostring(jar_row.text)))
+check('the decompiled jar row points at the filled buffer',
+  jar_row.bufnr and vim.api.nvim_buf_get_name(jar_row.bufnr):find('jar:', 1, true) ~= nil
+    and vim.api.nvim_buf_line_count(jar_row.bufnr) == #DECOMPILED,
+  jar_row.bufnr and vim.api.nvim_buf_get_name(jar_row.bufnr))
 
 local qf_win = vim.api.nvim_get_current_win()
 check('focus is in the list, not the editor',
@@ -272,7 +347,7 @@ check('quickfix index follows the cursor', vim.fn.getqflist({ idx = 0 }).idx == 
 check('syncing the index preserves the match extmark',
   #vim.api.nvim_buf_get_extmarks(vim.api.nvim_win_get_buf(qf_win), ns, 0, -1, {}) == 1,
   #vim.api.nvim_buf_get_extmarks(vim.api.nvim_win_get_buf(qf_win), ns, 0, -1, {}))
-check('syncing the index preserves the items', #vim.fn.getqflist() == 3, #vim.fn.getqflist())
+check('syncing the index preserves the items', #vim.fn.getqflist() == 4, #vim.fn.getqflist())
 check('syncing the index preserves the title',
   vim.fn.getqflist({ title = 0 }).title ~= '', vim.fn.getqflist({ title = 0 }).title)
 check('editor follows the selection',
@@ -281,16 +356,18 @@ check('editor follows the selection',
 check('focus stayed in the list while stepping', vim.api.nvim_get_current_win() == qf_win)
 check('browsing leaves the editor jumplist clean',
   #vim.fn.getjumplist(origin_win)[1] == 0, #vim.fn.getjumplist(origin_win)[1])
-check('no jar/jrt buffer leaked by run()', (function()
+-- The empty buffer behind the unopenable row is wiped; the decompiled one behind the navigable row
+-- is what that row previews, so it has to stay.
+check('the empty jrt buffer was wiped by run()', (function()
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
-    local n = vim.api.nvim_buf_get_name(b)
-    if n:find('jar:', 1, true) or n:find('jrt:', 1, true) then return false end
+    if vim.api.nvim_buf_get_name(b):find('jrt:', 1, true) then return false end
   end
   return true
 end)())
+check('the decompiled jar buffer survived run()', vim.api.nvim_buf_is_valid(jar_row.bufnr))
 
 -- The invalid row is reachable with j even though :cnext skips it, so it must be inert.
-vim.api.nvim_win_set_cursor(qf_win, { 3, 0 })
+vim.api.nvim_win_set_cursor(qf_win, { jrt_idx, 0 })
 check('stepping onto the invalid row does not error', pcall(vim.cmd, 'doautocmd CursorMoved'))
 vim.wait(400)
 check('invalid row leaves the preview untouched',
@@ -302,6 +379,22 @@ check('invalid row gets no extmark',
 -- :cnext refuses to land on an invalid row, so pointing the index at one would put the selection bar
 -- somewhere <CR> could never go. It stays on the last valid entry instead.
 check('invalid row leaves the quickfix index alone', vim.fn.getqflist({ idx = 0 }).idx == 2,
+  vim.fn.getqflist({ idx = 0 }).idx)
+
+-- The decompiled row previews like a project file: the editor shows the library buffer, the match
+-- is highlighted in the list, and the selection bar follows.
+vim.api.nvim_win_set_cursor(qf_win, { jar_idx, 0 })
+vim.cmd('doautocmd CursorMoved')
+vim.wait(400)
+check('decompiled row previews its buffer',
+  vim.api.nvim_win_get_buf(origin_win) == jar_row.bufnr,
+  vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(origin_win)))
+check('decompiled row previews on the referenced line',
+  vim.api.nvim_win_get_cursor(origin_win)[1] == 3, vim.inspect(vim.api.nvim_win_get_cursor(origin_win)))
+check('decompiled row gets a match extmark',
+  #vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, {}) == 1,
+  #vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, {}))
+check('decompiled row moves the quickfix index', vim.fn.getqflist({ idx = 0 }).idx == jar_idx,
   vim.fn.getqflist({ idx = 0 }).idx)
 
 -- q / <Esc>: back exactly where grr was pressed, however far the browsing wandered.
@@ -317,6 +410,22 @@ check('restored the origin cursor',
 check('augroup torn down',
   not pcall(vim.api.nvim_get_autocmds, { group = 'IntellijLspReferences' }))
 check('close() twice is a no-op', pcall(refs.close, true))
+
+-- grr pressed *inside* a decompiled class. The old blanket wipe of every jar:/jrt: buffer took the
+-- origin buffer with it, so q had nothing to restore to and the window was yanked elsewhere.
+local lib_buf = jar_row.bufnr
+vim.api.nvim_set_current_buf(lib_buf)
+vim.lsp.buf_attach_client(lib_buf, cid)
+vim.api.nvim_win_set_cursor(0, { 3, 4 })
+refs.run()
+vim.wait(2000, function() return refs.is_open() end)
+check('session opens from a decompiled buffer', refs.is_open() == true)
+check('the origin library buffer survives run()', vim.api.nvim_buf_is_valid(lib_buf))
+refs.close(true)
+check('q restores the decompiled origin buffer',
+  vim.api.nvim_get_current_buf() == lib_buf and vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 3, 4 }),
+  vim.inspect({ vim.api.nvim_buf_get_name(0), vim.api.nvim_win_get_cursor(0) }))
+vim.cmd('edit ' .. HYG .. '/A1.java')
 
 -- <CR>: unlike the previews, this jump *should* be in the jumplist.
 vim.cmd('clearjumps')
@@ -394,34 +503,50 @@ check('run() without a client notifies',
   notified ~= nil and tostring(notified):find('no client') ~= nil, vim.inspect(notified))
 
 -- -------------------------------------------------------------------------------------------------
--- No phantom buffers left behind
+-- The premise: what locations_to_items does with jar: and jrt: URIs
 -- -------------------------------------------------------------------------------------------------
--- locations_to_items creates one buffer per non-file URI, named after the URI resolved against cwd.
+-- hydrate() exists because Neovim treats the two schemes differently (see is_external): a `jrt:`
+-- buffer is bufloaded -- so a BufReadCmd fills it and the item carries the line -- while a `jar:`
+-- buffer, named under cwd, is read as a file and the item comes back empty with columns clamped to 1.
+-- Asserted against the real locations_to_items, so a Neovim release changing either half shows up
+-- here rather than as library rows silently falling back to the unopenable path.
+local filled = {}
+vim.api.nvim_create_autocmd('BufReadCmd', {
+  group = vim.api.nvim_create_augroup('IntellijLspRefsFakeDecompiler', { clear = true }),
+  pattern = { '*/jar:*', 'jrt:/*' },
+  callback = function(args)
+    filled[#filled + 1] = args.file
+    vim.api.nvim_buf_set_lines(args.buf, 0, -1, false, { 'a', 'b', 'c', 'class F {}' })
+  end,
+})
 local items = vim.lsp.util.locations_to_items({
-  { uri = 'jar:file:///l/lib.jar!/com/E.class',
-    range = { start = { line = 3, character = 0 }, ['end'] = { line = 3, character = 5 } } },
+  { uri = 'jrt:/java.base/java/lang/Object.class',
+    range = { start = { line = 3, character = 6 }, ['end'] = { line = 3, character = 7 } } },
+  { uri = 'jar:file:///l/other.jar!/com/F.class',
+    range = { start = { line = 3, character = 6 }, ['end'] = { line = 3, character = 7 } } },
 }, 'utf-16')
-check('locations_to_items yields empty text for jar:', items[1].text == '',
-  ('%q'):format(items[1].text))
+local by_uri = {}
+for _, it in ipairs(items) do by_uri[it.user_data.uri] = it end
+local jrt_item = by_uri['jrt:/java.base/java/lang/Object.class']
+local jar_item = by_uri['jar:file:///l/other.jar!/com/F.class']
+check('jrt: is loaded through BufReadCmd by locations_to_items',
+  #filled == 1 and filled[1]:find('jrt:', 1, true) ~= nil, vim.inspect(filled))
+check('jrt: item carries the filled line and columns',
+  jrt_item.text == 'class F {}' and jrt_item.col == 7 and jrt_item.end_col == 8,
+  vim.inspect({ jrt_item.text, jrt_item.col, jrt_item.end_col }))
+check('jar: item comes back empty with clamped columns (why hydrate reloads)',
+  jar_item.text == '' and jar_item.col == 1 and jar_item.end_col == 1,
+  vim.inspect({ jar_item.text, jar_item.col, jar_item.end_col }))
+check('jar: buffer exists but is not loaded',
+  vim.fn.bufexists(vim.uri_to_fname('jar:file:///l/other.jar!/com/F.class')) == 1
+    and vim.fn.bufloaded(vim.uri_to_fname('jar:file:///l/other.jar!/com/F.class')) == 0)
 
-local leaked_before = 0
-for _, b in ipairs(vim.api.nvim_list_bufs()) do
-  if vim.api.nvim_buf_get_name(b):find('jar:', 1, true) then leaked_before = leaked_before + 1 end
-end
-check('the phantom buffer really is created (why the wipe exists)', leaked_before > 0, leaked_before)
-
--- Same predicate the module wipes with.
-for _, b in ipairs(vim.api.nvim_list_bufs()) do
-  local n = vim.api.nvim_buf_get_name(b)
-  if n:find('jar:', 1, true) or n:find('jrt:', 1, true) then
-    pcall(vim.api.nvim_buf_delete, b, { force = true, unload = false })
-  end
-end
-local leaked_after = 0
-for _, b in ipairs(vim.api.nvim_list_bufs()) do
-  if vim.api.nvim_buf_get_name(b):find('jar:', 1, true) then leaked_after = leaked_after + 1 end
-end
-check('phantom buffers are wipeable', leaked_after == 0, leaked_after)
+-- ...and hydrate turns that jar: item into a navigable row anyway.
+local fixed, left = refs._tag_items({ jar_item }, 'utf-16')
+check('hydrate loads the jar: buffer and rebuilds the row',
+  left == 0 and fixed[1].valid == 1 and fixed[1].text == 'class F {}' and fixed[1].col == 7
+    and fixed[1].end_col == 8 and fixed[1].lnum == 4,
+  vim.inspect(fixed[1]))
 
 -- Origin state is still intact after all of the above.
 check('origin buffer still valid', vim.api.nvim_buf_is_valid(origin_buf))

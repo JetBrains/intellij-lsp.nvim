@@ -2,8 +2,8 @@
 ---
 --- The server answers definitions inside libraries and the JDK with `jar:file:///...!/Foo.class` and
 --- `jrt:/java.base/java/lang/String.class`. Neovim has no reader for either scheme, so following one
---- landed you in an empty buffer named after the URI -- the limitation references.lua works around by
---- marking those rows `valid = 0`.
+--- landed you in an empty buffer named after the URI. The same BufReadCmd is what lets references.lua
+--- list a library reference as a navigable, previewable row.
 ---
 --- The server already decompiles on request: `executeCommand` "decompile" takes the URI as its single
 --- argument and answers `{code, language}`, or null when the file cannot be read (the server accepts

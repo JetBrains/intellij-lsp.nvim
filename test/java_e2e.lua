@@ -209,7 +209,8 @@ if browse.is_open() then
   check('list closes and restores', not browse.is_open())
 end
 
--- A JDK-typed reference: library results must be non-navigable rows, never phantom buffers.
+-- A JDK-typed reference with the declaration included: the row inside the JDK must be a navigable
+-- one backed by decompiled source, not a `valid = 0` placeholder and not an empty phantom buffer.
 vim.cmd('edit ' .. MAIN)
 local mbuf = vim.api.nvim_get_current_buf()
 local mlines = vim.fn.readfile(MAIN)
@@ -223,18 +224,38 @@ for i, l in ipairs(mlines) do
 end
 if sline then
   vim.api.nvim_win_set_cursor(0, { sline + 1, scol })
-  browse.run({ include_declaration = false })
+  browse.run({ include_declaration = true })
   if vim.wait(30000, function() return browse.is_open() end) then
-    local leaked
-    for _, b in ipairs(vim.api.nvim_list_bufs()) do
-      local n = vim.api.nvim_buf_get_name(b)
-      if n:find('jar:', 1, true) or n:find('jrt:', 1, true) then
-        leaked = n
+    local qwin = vim.api.nvim_get_current_win()
+    local jdk_idx, jdk_row
+    for i, r in ipairs(vim.fn.getqflist()) do
+      local u = vim.tbl_get(r, 'user_data', 'uri') or ''
+      if u:find('^jrt:') or u:find('^jar:') then
+        jdk_idx, jdk_row = i, r
         break
       end
     end
-    check('no jar:/jrt: buffer leaked by a JDK reference', leaked == nil, leaked)
+    check('the String declaration shows up as a library row', jdk_row ~= nil)
+    if jdk_row then
+      check('library row is navigable', jdk_row.valid == 1, jdk_row.valid)
+      check('library row carries decompiled text', (jdk_row.text or '') ~= '', ('%q'):format(jdk_row.text))
+      check('library row is pinned to a filled buffer',
+        jdk_row.bufnr and vim.api.nvim_buf_line_count(jdk_row.bufnr) > 2,
+        jdk_row.bufnr and vim.api.nvim_buf_line_count(jdk_row.bufnr))
+      vim.api.nvim_win_set_cursor(qwin, { jdk_idx, 0 })
+      vim.cmd('doautocmd CursorMoved')
+      vim.wait(500)
+      local shown = vim.api.nvim_win_get_buf(gwin)
+      check('stepping onto the library row previews the decompiled class', shown == jdk_row.bufnr,
+        vim.api.nvim_buf_get_name(shown))
+      check('preview sits on the declaration line',
+        vim.api.nvim_buf_get_lines(shown, vim.api.nvim_win_get_cursor(gwin)[1] - 1,
+          vim.api.nvim_win_get_cursor(gwin)[1], false)[1]:find('class String', 1, true) ~= nil,
+        vim.api.nvim_win_get_cursor(gwin)[1])
+    end
     browse.close(true)
+    check('closing restores Main.java', vim.api.nvim_get_current_buf() == mbuf,
+      vim.api.nvim_buf_get_name(0))
   else
     note('String references did not resolve; JDK-row check skipped')
   end
@@ -266,6 +287,41 @@ if sline then
     check('cursor sits on the String declaration',
       vim.api.nvim_get_current_line():find('class String', 1, true) ~= nil, vim.api.nvim_get_current_line())
     note('String resolved to ' .. jname .. ':' .. vim.api.nvim_win_get_cursor(0)[1])
+
+    -- grr *inside* the decompiled class, on a method of it. The declaration is itself a JDK
+    -- location, and the old implementation wiped every jar:/jrt: buffer -- this one included -- then
+    -- announced that the row was "not listed here". Now it is a row, and q brings you back.
+    local lib_win = vim.api.nvim_get_current_win()
+    vim.wait(10000, function() return vim.lsp.get_clients({ bufnr = jbuf, name = 'intellij' })[1] ~= nil end, 100)
+    local mline, mcol
+    for i, l in ipairs(vim.api.nvim_buf_get_lines(jbuf, 0, -1, false)) do
+      local c = l:find('public int length()', 1, true)
+      if c then
+        mline, mcol = i, c + #'public int ' - 1
+        break
+      end
+    end
+    if mline then
+      vim.api.nvim_win_set_cursor(lib_win, { mline, mcol })
+      browse.run({ include_declaration = true })
+      if vim.wait(30000, function() return browse.is_open() end) then
+        check('grr inside a decompiled class keeps that buffer alive', vim.api.nvim_buf_is_valid(jbuf))
+        local decl
+        for _, r in ipairs(vim.fn.getqflist()) do
+          if r.bufnr == jbuf and r.lnum == mline then decl = r end
+        end
+        check('the declaration inside the JDK is a navigable row', decl ~= nil and decl.valid == 1,
+          vim.inspect(decl))
+        browse.close(true)
+        check('q returns to the decompiled class',
+          vim.api.nvim_get_current_buf() == jbuf and vim.api.nvim_win_get_cursor(0)[1] == mline,
+          vim.inspect({ vim.api.nvim_buf_get_name(0), vim.api.nvim_win_get_cursor(0) }))
+      else
+        note('references from inside String.class did not resolve; in-library grr check skipped')
+      end
+    else
+      note('String.length() not found in the decompiled source; in-library grr check skipped')
+    end
   end
 end
 

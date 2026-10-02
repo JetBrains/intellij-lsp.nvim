@@ -158,6 +158,10 @@ Neovim's built-in LSP behaviour.
 | `<CR>` | jump to the reference and close the list |
 | `q` / `<Esc>` | close and return to where `grr` was pressed |
 
+References inside libraries and the JDK are ordinary rows: stepping onto one previews the decompiled
+class (or its attached sources), and `<CR>` jumps into it. This needs `decompiler = true` (the
+default); with it off, those rows are listed but cannot be opened.
+
 ### Output panel (`:IntellijLspOutput`, runs, builds)
 
 | Key | Action |
