@@ -122,8 +122,22 @@ end
 local function start_for_buffer(bufnr)
   if vim.b[bufnr].intellij_lsp_attached then return end
 
-  -- Attach to a server that already covers this file, whatever root it was started with.
   local name = vim.api.nvim_buf_get_name(bufnr)
+
+  -- A decompiled jar:/jrt: buffer gets its filetype from decompiler.lua, which lands here. It has no
+  -- project of its own: walking up from a URI ends at the relative directory ".", where the cwd's
+  -- build file made "." the root and started a second server that failed `initialize` on the
+  -- workspace folder `file://.`. It belongs to the server that produced it.
+  local library_client = vim.b[bufnr].intellij_lsp_library_client
+  if library_client or name:match('^jrt:') or name:find('jar:', 1, true) then
+    if library_client and vim.lsp.get_client_by_id(library_client) then
+      vim.b[bufnr].intellij_lsp_attached = true
+      vim.lsp.buf_attach_client(bufnr, library_client)
+    end
+    return
+  end
+
+  -- Attach to a server that already covers this file, whatever root it was started with.
   local existing = name ~= '' and client.find_ancestor_client(name) or nil
   if existing then
     vim.b[bufnr].intellij_lsp_attached = true
@@ -177,6 +191,7 @@ local function is_shared_dir(dir)
 end
 
 M._is_shared_dir = is_shared_dir
+M._start_for_buffer = start_for_buffer
 
 local function start_eagerly()
   -- Global rather than per-directory on purpose: a `:cd` into another project mid-session is not a

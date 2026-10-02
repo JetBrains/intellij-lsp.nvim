@@ -821,6 +821,38 @@ do
   vim.lsp.get_clients = real_get_clients
 end
 
+-- Regression: setting the filetype on a decompiled buffer runs the plugin's FileType attach. Rooting
+-- a URI-named buffer walks up to the relative directory ".", so with a build file in the cwd a second
+-- server was started on "." and failed `initialize` ("Expected scheme-specific part at index 5:
+-- file:"). A library buffer attaches to the client that decompiled it and never starts one.
+do
+  local started, attached = 0, nil
+  local real_start, real_attach, real_by_id = vim.lsp.start, vim.lsp.buf_attach_client, vim.lsp.get_client_by_id
+  vim.lsp.start = function() started = started + 1 end
+  vim.lsp.buf_attach_client = function(_, id) attached = id end
+  vim.lsp.get_client_by_id = function(id) return id == 4242 and { id = 4242 } or real_by_id(id) end
+  local old_cwd = vim.fn.getcwd()
+  local proj = vim.fn.tempname()
+  vim.fn.mkdir(proj, 'p')
+  vim.fn.writefile({ '<project/>' }, proj .. '/pom.xml')
+  vim.cmd('cd ' .. vim.fn.fnameescape(proj))
+
+  local start_for_buffer = require('intellij-lsp')._start_for_buffer
+  local lib = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(lib, 'jar:///jdk/lib/src.zip!/java.base/java/lang/String.java')
+  vim.b[lib].intellij_lsp_library_client = 4242
+  start_for_buffer(lib)
+  check('a library buffer attaches to the client that served it', attached == 4242, attached)
+
+  local orphan = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(orphan, 'jrt:/java.base/java/lang/Orphan.class')
+  start_for_buffer(orphan)
+  check('a library buffer never starts a server of its own', started == 0, started)
+
+  vim.cmd('cd ' .. vim.fn.fnameescape(old_cwd))
+  vim.lsp.start, vim.lsp.buf_attach_client, vim.lsp.get_client_by_id = real_start, real_attach, real_by_id
+end
+
 do -- scoped: Lua allows 200 locals per chunk
 -- ---------------------------------------------------------------------------
 -- intellij/ extension notifications

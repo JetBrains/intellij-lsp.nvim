@@ -89,13 +89,17 @@ end
 --- @param bufnr integer
 --- @param uri string
 function M.load(bufnr, uri)
+  local client = find_client()
+  -- Read by init.lua when `fill` sets the filetype: the buffer attaches to this client instead of
+  -- being rooted like a project file.
+  vim.b[bufnr].intellij_lsp_library_client = client and client.id or nil
+
   local cached = cache[uri]
   if cached then
     fill(bufnr, cached.lines, cached.filetype)
     return
   end
 
-  local client = find_client()
   if not client then
     fill(bufnr, { '// IntelliJ LSP: no server attached; cannot decompile', '// ' .. uri }, nil)
     return
