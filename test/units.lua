@@ -290,7 +290,8 @@ local function stub_server(dispatch)
   return {
     request = function(method, _, callback)
       if method == 'initialize' then
-        callback(nil, { capabilities = {} })
+        -- Deferred like a real server's reply, so the client is observably uninitialized first.
+        vim.schedule(function() callback(nil, { capabilities = {} }) end)
       elseif method == 'shutdown' then
         callback(nil, nil)
       end
@@ -311,6 +312,12 @@ local eager_cfg = vim.tbl_extend('force', client.config(eager_root, {}), { cmd =
 local eager_id = vim.lsp.start(eager_cfg, { attach = false })
 check('eager start needs no buffer', eager_id ~= nil, tostring(eager_id))
 local eager_client = eager_id and vim.lsp.get_client_by_id(eager_id)
+-- A file opened while the real server is still starting (seconds of JVM start) must find it too,
+-- or it starts a second server on its module root.
+check('the eager client starts uninitialized', eager_client and not eager_client.initialized)
+local early = client.find_ancestor_client(MODULE_FILE)
+check('an ancestor client is found before it has initialized',
+  early ~= nil and early.id == eager_id, early and early.id)
 vim.wait(2000, function() return eager_client and eager_client.initialized end)
 
 if not (eager_client and eager_client.initialized) then

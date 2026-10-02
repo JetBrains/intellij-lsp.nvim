@@ -115,7 +115,11 @@ function M.find_ancestor_client(path)
 
   local best --- @type vim.lsp.Client|nil
   local best_root = ''
-  for _, c in ipairs(vim.lsp.get_clients({ name = M.NAME })) do
+  -- `_uninitialized`: plain `get_clients` hides a client until its `initialize` round trip is done,
+  -- which for this server is seconds of JVM start. A file opened in that window would miss the
+  -- eagerly started client and start a second server on its own module root. `buf_attach_client`
+  -- accepts an uninitialized client and sends `didOpen` once it is ready.
+  for _, c in ipairs(vim.lsp.get_clients({ name = M.NAME, _uninitialized = true })) do
     local root = c.config.root_dir and vim.fs.normalize(c.config.root_dir)
     if root and contains(root, path) then
       -- Deepest wins: with a nested pair of roots the tighter one is the better-scoped project.
