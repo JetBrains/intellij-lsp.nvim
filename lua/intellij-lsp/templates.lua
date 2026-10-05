@@ -174,11 +174,14 @@ function M.is_empty_new_file(bufnr)
   return #lines <= 1 and (lines[1] or '') == ''
 end
 
---- Called from `on_attach`: a buffer that BufNewFile flagged, still empty, gets the picker.
+--- Called from `on_attach`, and from BufNewFile: a flagged buffer, still empty, gets the picker.
 ---
---- Runs from `on_attach` rather than BufNewFile because the request needs an attached client, and
---- BufNewFile fires before FileType, which is what starts the server. The flag is cleared so a
---- reattach (a server restart) does not ask again.
+--- The request needs an attached client, and which of the two events comes second depends on the
+--- server. Filetype detection runs in its own, earlier BufNewFile handler, so FileType fires before
+--- ours. When that FileType starts a server, `on_attach` comes later, after the flag is set. When it
+--- attaches to a server that is already running, `on_attach` runs inside it, before the flag exists,
+--- and the BufNewFile handler is the one that finds the client. The flag is cleared so a reattach (a
+--- server restart) does not ask again.
 --- @param client vim.lsp.Client
 --- @param bufnr integer
 --- @param cfg table
@@ -197,7 +200,8 @@ end
 --- Marks new files so `on_attach` can tell them from existing ones. Registered once from `setup()`.
 --- @param group integer augroup
 --- @param filetypes string[]
-function M.setup_autocmd(group, filetypes)
+--- @param cfg table  plugin config, for the template overrides
+function M.setup_autocmd(group, filetypes, cfg)
   local patterns = {}
   for _, ft in ipairs(filetypes) do
     patterns[#patterns + 1] = ft == 'kotlin' and '*.kt' or ('*.' .. ft)
@@ -206,7 +210,11 @@ function M.setup_autocmd(group, filetypes)
     group = group,
     pattern = patterns,
     desc = 'IntelliJ: remember that this buffer is a new file',
-    callback = function(args) vim.b[args.buf].intellij_lsp_new_file = true end,
+    callback = function(args)
+      vim.b[args.buf].intellij_lsp_new_file = true
+      local attached = vim.lsp.get_clients({ bufnr = args.buf, name = require('intellij-lsp.client').NAME })[1]
+      if attached then M.on_attach(attached, args.buf, cfg or {}) end
+    end,
   })
 end
 

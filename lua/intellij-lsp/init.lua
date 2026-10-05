@@ -478,7 +478,7 @@ local function finish_setup()
   -- client exists to ask.
   if M.config.file_templates ~= false then
     local templates = require('intellij-lsp.templates')
-    templates.setup_autocmd(group, M.config.filetypes)
+    templates.setup_autocmd(group, M.config.filetypes, M.config)
     vim.api.nvim_create_user_command('IntellijLspFileTemplate', templates.command, {
       desc = 'Fill this empty file from an IntelliJ file template',
     })
