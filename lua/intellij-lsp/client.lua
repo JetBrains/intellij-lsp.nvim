@@ -783,9 +783,13 @@ function M.config(root_dir, cfg)
   -- The same handler also takes the snippet edits out before Neovim applies the rest, and expands
   -- them afterwards: `apply_workspace_edit` has no notion of `snippet` and would fail on the missing
   -- `newText`. See snippet_edit.lua for why the capability is advertised at all.
+  --
+  -- The label is dropped: Neovim prints it, and this server's is `Update file:///<absolute path>`,
+  -- longer than the message area, so every applied code action ended on a hit-enter prompt.
   handlers['workspace/applyEdit'] = function(err, params, ctx, cfg_)
     local snippets = {}
     if params then
+      params.label = nil
       versions.fix_workspace_edit(ctx.client_id, params.edit)
       snippets = require('intellij-lsp.snippet_edit').extract(params.edit)
     end
