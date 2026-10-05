@@ -424,6 +424,19 @@ local function finish_setup()
     callback = function(args) start_for_buffer(args.buf) end,
   })
 
+  -- `:edit` on a loaded buffer unloads it, which detaches every client, then fires FileType again.
+  -- Buffer variables survive the unload, so without this the attach guard would still read true
+  -- and that FileType would leave the buffer with no server.
+  vim.api.nvim_create_autocmd('LspDetach', {
+    group = group,
+    callback = function(args)
+      local c = vim.lsp.get_client_by_id(args.data.client_id)
+      if c and c.name == client.NAME and vim.api.nvim_buf_is_valid(args.buf) then
+        vim.b[args.buf].intellij_lsp_attached = nil
+      end
+    end,
+  })
+
   -- StdinReadPost fires before VimEnter, so this flag is reliably set by the time the eager check
   -- runs. `nvim -` has no project context, and its buffer is unnamed, so there is nothing to root on.
   vim.api.nvim_create_autocmd('StdinReadPost', {

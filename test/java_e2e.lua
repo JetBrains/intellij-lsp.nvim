@@ -115,6 +115,14 @@ local progress = require('intellij-lsp.progress')
 local ready = vim.wait(600000, function() return progress.is_ready(client.id) end, 1000)
 check('indexing completed (intellij/ready-for-test)', ready)
 
+-- `:edit` unloads and rereads the buffer, which detaches the client; the FileType that follows must
+-- attach it again, to the same server.
+vim.cmd('edit')
+vim.wait(5000, function() return #vim.lsp.get_clients({ bufnr = bufnr, name = 'intellij' }) > 0 end, 50)
+local reattached = vim.lsp.get_clients({ bufnr = bufnr, name = 'intellij' })[1]
+check(':edit keeps the buffer attached', reattached ~= nil)
+check(':edit reattaches to the same server', reattached and reattached.id == client.id, reattached and reattached.id)
+
 -- navigation: Greeter on line 5 of Main.java -> Greeter.java
 vim.api.nvim_win_set_cursor(0, { 5, 8 })
 local defs = client:request_sync('textDocument/definition', {
