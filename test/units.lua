@@ -1261,9 +1261,22 @@ local short = { { name = 'alpha' }, { name = 'beta' }, { name = 'gamma' } }
 
 local called, item, idx = pick('2', short)
 check('a bare digit selects, no <CR>', called and idx == 2 and item.name == 'beta', tostring(idx))
--- Regression: the menu is echoed as `{text}` chunks. Flattening it to bare strings makes nvim_echo
--- throw, which the surrounding pcall turned into a silent dismissal -- every pick answered nil.
+-- Regression: a menu that fails to render must not turn into a silent dismissal; the surrounding
+-- pcall once made every pick answer nil that way.
 check('selecting returns the item', item ~= nil and item.name == 'beta')
+
+-- The menu is a float, not an echo: in a terminal an echoed multi-line menu raises the hit-enter
+-- prompt, which says "Press ENTER" and blocks timers and RPC until a key arrives.
+local menu_win = ui_select._open_menu(short, { prompt = 'Code actions:', format_item = function(i) return i.name end })
+local menu_cfg = vim.api.nvim_win_get_config(menu_win)
+local menu_lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(menu_win), 0, -1, false)
+check('menu opens as a float', menu_cfg.relative ~= '', vim.inspect(menu_cfg.relative))
+check('menu numbers its entries', menu_lines[1] == ' 1  alpha ' and menu_lines[3] == ' 3  gamma ', vim.inspect(menu_lines))
+check('menu carries the prompt as its title', vim.inspect(menu_cfg.title):find('Code actions:', 1, true) ~= nil, vim.inspect(menu_cfg.title))
+vim.api.nvim_win_close(menu_win, true)
+pick('2', short)
+local floats_left = vim.tbl_filter(function(w) return vim.api.nvim_win_get_config(w).relative ~= '' end, vim.api.nvim_list_wins())
+check('menu closes after the pick', #floats_left == 0, #floats_left)
 
 for _, key in ipairs({ { '\27', 'Esc' }, { 'q', 'q' } }) do
   local c, it, ix = pick(key[1], short)

@@ -35,23 +35,56 @@ local fallback = nil
 --- picker instead, which is visibly different but correct.
 local waiting = false
 
---- Renders the menu and reads one key.
+local ns = vim.api.nvim_create_namespace('intellij-lsp.select')
+
+--- Opens the menu in a float at the cursor and returns its window.
+---
+--- A float rather than `nvim_echo`: in a terminal UI a multi-line echo that is followed by
+--- `getchar()` raises the hit-enter prompt. It tells the user to "Press ENTER", which a bare digit
+--- does not need, and it waits for a key synchronously, so no timer, job callback or RPC request runs
+--- until one arrives. A float raises no prompt.
+--- @param items any[]
+--- @param opts table
+--- @return integer win
+function M._open_menu(items, opts)
+  local format_item = opts.format_item or tostring
+  local lines = {}
+  for i, item in ipairs(items) do
+    lines[#lines + 1] = (' %d  %s '):format(i, (tostring(format_item(item)):gsub('\n', ' ')))
+  end
+  local title = ' ' .. vim.trim(opts.prompt or 'Select one of:') .. ' '
+
+  local width = vim.fn.strdisplaywidth(title)
+  for _, l in ipairs(lines) do width = math.max(width, vim.fn.strdisplaywidth(l)) end
+  width = math.max(1, math.min(width, vim.o.columns - 4))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = 'wipe'
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  for i = 1, #lines do
+    vim.hl.range(buf, ns, 'Number', { i - 1, 1 }, { i - 1, 1 + #tostring(i) })
+  end
+
+  return vim.api.nvim_open_win(buf, false, {
+    relative = 'cursor', row = 1, col = 0,
+    width = width, height = math.max(1, math.min(#lines, vim.o.lines - 4)),
+    style = 'minimal', border = 'rounded', title = title, title_pos = 'left',
+    focusable = false, zindex = 200, noautocmd = true,
+  })
+end
+
+--- Shows the menu and reads one key.
 ---
 --- @param items any[]
 --- @param opts table
 --- @return integer|nil idx nil when dismissed
 local function ask(items, opts)
-  local format_item = opts.format_item or tostring
-
-  -- Each entry is a `{text}` chunk, which is the shape nvim_echo wants; flattening this into bare
-  -- strings makes it throw.
-  local chunks = { { (opts.prompt or 'Select one of:') .. '\n' } }
-  for i, item in ipairs(items) do
-    chunks[#chunks + 1] = { ('%d: %s\n'):format(i, format_item(item)) }
-  end
-  vim.api.nvim_echo(chunks, false, {})
+  local win = M._open_menu(items, opts)
+  vim.cmd('redraw')
 
   local ok, c = pcall(vim.fn.getchar)
+  pcall(vim.api.nvim_win_close, win, true)
+  vim.cmd('redraw')
   -- <C-c> surfaces as an error from getchar rather than a keycode, so a failed pcall is a dismissal
   -- and not something to report.
   if not ok then return nil end
@@ -63,15 +96,6 @@ local function ask(items, opts)
   local idx = tonumber(vim.fn.nr2char(c))
   if not idx or idx < 1 or idx > #items then return nil end
   return idx
-end
-
---- Clears the menu from the message area.
----
---- Without this the prompt stays on screen after the pick, and on a multi-line menu it also leaves
---- the "Press ENTER" hit-enter prompt -- exactly the confirmation this module exists to remove.
-local function clear()
-  vim.api.nvim_echo({ { '' } }, false, {})
-  vim.cmd('redraw')
 end
 
 --- `vim.ui.select` with single-key answers for short lists.
@@ -93,7 +117,6 @@ function M.select(items, opts, on_choice)
   -- that merely looks unresponsive, which is how a shape bug in the echo call hid here once.
   local ok, idx = pcall(ask, items, opts)
   waiting = false
-  clear()
 
   if not ok then
     vim.notify('IntelliJ LSP: select prompt failed: ' .. tostring(idx), vim.log.levels.ERROR)
