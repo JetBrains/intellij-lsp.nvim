@@ -1979,5 +1979,49 @@ editor.format({ bufnr = ed_buf, line1 = 2, line2 = 3 })
 check('format with a range covers the given lines', fmt_opts.range and fmt_opts.range['start'][1] == 2 and fmt_opts.range['end'][1] == 3 and fmt_opts.range['end'][2] == 3, vim.inspect(fmt_opts and fmt_opts.range))
 vim.lsp.buf.format = real_fmt
 
+-- asIs snippet completions: the line's own indentation comes off every continuation line, because
+-- vim.snippet.expand adds it back. Plain-text, single-line and adjustIndentation items are untouched.
+local ai_buf = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(ai_buf, 0, -1, false, { '\t\towner.getPets().for' })
+local function ai_item(mode, fmt, text)
+  return { insertTextMode = mode, insertTextFormat = fmt, textEdit = { newText = text,
+    range = { start = { line = 0, character = 2 }, ['end'] = { line = 0, character = 19 } } } }
+end
+local ai_result = { items = {
+  ai_item(1, 2, 'for (Pet ${1:pet} : owner.getPets()) {\n\t\t\t${0}\n\t\t\\}'),
+  ai_item(1, 1, 'a\n\t\tb'),
+  ai_item(2, 2, 'a\n\t\tb'),
+  ai_item(1, 2, 'one line'),
+  ai_item(1, 2, 'a\n\tshallower'),
+} }
+client.rebase_as_is_indent(ai_result, ai_buf)
+local ai = vim.tbl_map(function(i) return i.textEdit.newText end, ai_result.items)
+check('asIs snippet loses the base indent once', ai[1] == 'for (Pet ${1:pet} : owner.getPets()) {\n\t${0}\n\\}', ai[1])
+check('asIs plain text is left alone', ai[2] == 'a\n\t\tb', ai[2])
+check('adjustIndentation is left alone', ai[3] == 'a\n\t\tb', ai[3])
+check('single-line snippet is left alone', ai[4] == 'one line', ai[4])
+check('a line shallower than the base is left alone', ai[5] == 'a\n\tshallower', ai[5])
+local ai_default = { itemDefaults = { insertTextMode = 1 }, items = { ai_item(nil, 2, 'x\n\t\t\ty') } }
+client.rebase_as_is_indent(ai_default, ai_buf)
+check('asIs from itemDefaults counts', ai_default.items[1].textEdit.newText == 'x\n\ty', ai_default.items[1].textEdit.newText)
+
+-- The response fixes run on callers' own callbacks, which is how vim.lsp.completion and 0.12's
+-- vim.lsp.codelens call: a handler-table entry would never see those responses.
+local rf_replies = {
+  ['textDocument/codeLens'] = { { range = {}, command = { title = '$(play) Run' } } },
+  ['textDocument/hover'] = { contents = '$(play) untouched' },
+}
+local rf_client = { handlers = {}, request = function(_, method, _, h) h(nil, rf_replies[method], {}) return true, 1 end }
+client.install_response_fixes(rf_client)
+local rf_lens, rf_hover
+rf_client:request('textDocument/codeLens', {}, function(_, r) rf_lens = r end, 0)
+rf_client:request('textDocument/hover', {}, function(_, r) rf_hover = r end, 0)
+check('lens codicons stripped on a caller callback', rf_lens and rf_lens[1].command.title == 'Run', vim.inspect(rf_lens))
+local function rng(l, a, b) return { start = { line = l, character = a }, ['end'] = { line = l, character = b } } end
+local calls = { { from = { name = 'f' }, fromRanges = { rng(66, 6, 35), rng(66, 6, 35), rng(70, 1, 2), rng(66, 6, 35) } } }
+client.dedupe_call_ranges(calls)
+check('call hierarchy keeps one row per call site', #calls[1].fromRanges == 2 and calls[1].fromRanges[2].start.line == 70, vim.inspect(calls[1].fromRanges))
+check('other methods pass through untouched', rf_hover and rf_hover.contents == '$(play) untouched', vim.inspect(rf_hover))
+
 print(failures == 0 and '\nALL UNIT CHECKS PASSED' or ('\n' .. failures .. ' UNIT CHECK(S) FAILED'))
 vim.cmd(failures == 0 and 'qa!' or 'cq!')

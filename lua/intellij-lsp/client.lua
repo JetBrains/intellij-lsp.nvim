@@ -401,6 +401,97 @@ function M.setup_folding(cfg)
   if vim.o.foldlevelstart == -1 then vim.o.foldlevelstart = 99 end
 end
 
+--- Makes multi-line snippet completions land at the indentation the server computed.
+---
+--- The Java provider marks every item `insertTextMode = asIs`: a postfix `.for` arrives as
+--- `for (Pet ${1:pet} : owner.getPets()) {\n\t\t\t${0}\n\t\t\}`, already indented for the line it
+--- replaces. Neovim ignores the mode, and `vim.snippet.expand` prepends the current line's
+--- indentation to every line after the first, so the body and closing brace end up indented twice.
+--- Taking that indentation off each continuation line here lets `vim.snippet` put it back exactly
+--- once. A line that does not start with it is left as it is.
+--- @param result lsp.CompletionList|lsp.CompletionItem[]|nil
+--- @param bufnr integer
+function M.rebase_as_is_indent(result, bufnr)
+  if type(result) ~= 'table' or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  local items = result.items or result
+  local default_mode = vim.tbl_get(result, 'itemDefaults', 'insertTextMode')
+  for _, item in ipairs(items) do
+    local edit = item.textEdit
+    local mode = item.insertTextMode or default_mode
+    if mode == 1 and item.insertTextFormat == 2 and edit and edit.newText:find('\n', 1, true) then
+      local row = (edit.range or edit.replace).start.line
+      local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ''
+      local indent = line:match('^%s*')
+      if indent ~= '' then
+        edit.newText = edit.newText:gsub('\n' .. vim.pesc(indent), '\n')
+      end
+    end
+  end
+end
+
+--- Strips VS Code's codicon markup (`$(play) Run`) from every lens title in a codeLens result.
+--- @param result lsp.CodeLens[]|lsp.CodeLens|nil
+function M.strip_lens_codicons(result)
+  if type(result) ~= 'table' then return end
+  local lenses = result.range and { result } or result
+  for _, lens in ipairs(lenses) do
+    if lens.command and lens.command.title then
+      lens.command.title = require('intellij-lsp.run')._strip_codicons(lens.command.title)
+    end
+  end
+end
+
+--- Drops repeated `fromRanges` from a call hierarchy result.
+---
+--- For a method that overrides a chain of library methods (`OwnerRepository.findById` over Spring
+--- Data's `CrudRepository.findById` and its relatives), the server reports the same call site once
+--- per method in the chain, and Neovim lists one quickfix row per range.
+--- @param result lsp.CallHierarchyIncomingCall[]|lsp.CallHierarchyOutgoingCall[]|nil
+function M.dedupe_call_ranges(result)
+  if type(result) ~= 'table' then return end
+  for _, call in ipairs(result) do
+    local seen, unique = {}, {}
+    for _, r in ipairs(call.fromRanges or {}) do
+      local key = table.concat({ r.start.line, r.start.character, r['end'].line, r['end'].character }, ':')
+      if not seen[key] then
+        seen[key] = true
+        unique[#unique + 1] = r
+      end
+    end
+    call.fromRanges = unique
+  end
+end
+
+--- Responses rewritten before Neovim sees them, by method.
+local RESPONSE_FIXES = {
+  ['textDocument/completion'] = M.rebase_as_is_indent,
+  ['textDocument/codeLens'] = M.strip_lens_codicons,
+  ['codeLens/resolve'] = M.strip_lens_codicons,
+  ['callHierarchy/incomingCalls'] = M.dedupe_call_ranges,
+  ['callHierarchy/outgoingCalls'] = M.dedupe_call_ranges,
+}
+
+--- Wraps `request` on one client instance so the responses in `RESPONSE_FIXES` are rewritten before
+--- their caller sees them. A handler-table entry is not enough: `vim.lsp.completion`, and on 0.12
+--- `vim.lsp.codelens`, pass callbacks of their own, which `Client:request` calls instead. Same
+--- technique as `versions.install`, which this stacks on top of.
+--- @param client vim.lsp.Client
+function M.install_response_fixes(client)
+  local orig_request = client.request
+  client.request = function(self, method, params, handler, bufnr, ...)
+    local fix = RESPONSE_FIXES[method]
+    -- A nil handler is resolved the way `Client:request` would, so behaviour is unchanged.
+    local h = fix and (handler or (self.handlers and self.handlers[method]) or vim.lsp.handlers[method])
+    if not h then
+      return orig_request(self, method, params, handler, bufnr, ...)
+    end
+    return orig_request(self, method, params, function(err, result, ctx, ...)
+      fix(result, ctx and ctx.bufnr or bufnr or 0)
+      return h(err, result, ctx, ...)
+    end, bufnr, ...)
+  end
+end
+
 --- Makes the completion menu filter dotted candidates the way this server expects.
 ---
 --- Neovim derives the typed prefix with `\k*$`, and `.` is not in `iskeyword`, so on
@@ -684,19 +775,6 @@ function M.config(root_dir, cfg)
     commands = extensions.commands()
   end
 
-  -- The lens titles come from the server as `$(play) Run` and `$(debug) Debug` -- VS Code's codicon
-  -- markup, which Neovim renders literally as those seven characters. Stripped here, in the response,
-  -- rather than at display time, because `vim.lsp.codelens` owns the rendering and offers no hook
-  -- into it.
-  handlers['textDocument/codeLens'] = function(err, result, ctx, cfg_)
-    for _, lens in ipairs(result or {}) do
-      if lens.command and lens.command.title then
-        lens.command.title = require('intellij-lsp.run')._strip_codicons(lens.command.title)
-      end
-    end
-    return vim.lsp.handlers['textDocument/codeLens'](err, result, ctx, cfg_)
-  end
-
   -- The server stamps its edits with a document version of its own making, which Neovim rejects as
   -- stale after the first edit to a buffer; `versions.lua` has the full story. Client-initiated
   -- requests are rewritten by the `request` wrapper installed in `on_init`. This is the other
@@ -761,6 +839,10 @@ function M.config(root_dir, cfg)
 
       -- Before any buffer attaches, so the first `didOpen` is already on the ledger.
       versions.install(client)
+      -- The lens titles come from the server as `$(play) Run` and `$(debug) Debug`, VS Code's
+      -- codicon markup, which Neovim renders literally. Stripped in the response rather than at
+      -- display time, because `vim.lsp.codelens` owns the rendering and offers no hook into it.
+      M.install_response_fixes(client)
     end,
 
     on_attach = function(client, bufnr)
