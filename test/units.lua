@@ -2023,5 +2023,14 @@ client.dedupe_call_ranges(calls)
 check('call hierarchy keeps one row per call site', #calls[1].fromRanges == 2 and calls[1].fromRanges[2].start.line == 70, vim.inspect(calls[1].fromRanges))
 check('other methods pass through untouched', rf_hover and rf_hover.contents == '$(play) untouched', vim.inspect(rf_hover))
 
+-- Debug panel labels: no doubled `:98` on a frame whose name already carries it, no `:0` on the
+-- hidden-frames placeholder, no leading spaces before the type of a value-less variable.
+local dbg = require('intellij-lsp.debug')
+check('frame label keeps the adapter location', dbg._frame_label({ name = 'at a.B.c(B.java:98)', line = 98 }) == 'at a.B.c(B.java:98)', dbg._frame_label({ name = 'at a.B.c(B.java:98)', line = 98 }))
+check('frame label drops line 0', dbg._frame_label({ name = '53 hidden frames', line = 0 }) == '53 hidden frames', dbg._frame_label({ name = '53 hidden frames', line = 0 }))
+check('frame label appends a missing line', dbg._frame_label({ name = 'main', line = 7 }) == 'main:7', dbg._frame_label({ name = 'main', line = 7 }))
+check('value-less variable shows only its type', dbg._format_value({ value = ' ', type = 'Owner@1' }) == '(Owner@1)', dbg._format_value({ value = ' ', type = 'Owner@1' }))
+check('value and type', dbg._format_value({ value = '1', type = 'int' }) == '1  (int)', dbg._format_value({ value = '1', type = 'int' }))
+
 print(failures == 0 and '\nALL UNIT CHECKS PASSED' or ('\n' .. failures .. ' UNIT CHECK(S) FAILED'))
 vim.cmd(failures == 0 and 'qa!' or 'cq!')

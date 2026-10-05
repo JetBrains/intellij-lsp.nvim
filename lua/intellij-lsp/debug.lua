@@ -432,6 +432,17 @@ end
 --- Always goes through this one path, in every state (suspended, running, no session) -- README
 --- "A resume must not blank the watch list" is a consequence of `clear()` writing a *different*,
 --- fixed rendering instead of re-rendering watches through here with pending placeholders.
+--- One call-stack row. The Java adapter already ends a frame's name with `(File.java:98)`, and its
+--- "53 hidden frames" placeholder has line 0, so `:line` is appended only when it adds something.
+--- @param frame table  a DAP StackFrame
+--- @return string
+function M._frame_label(frame)
+  local name = frame.name or '?'
+  local line = frame.line
+  if not line or line <= 0 or name:find(':' .. line .. ')', 1, true) then return name end
+  return name .. ':' .. line
+end
+
 function M._render()
   if not panel then return end
   local buf = ensure_root_buf()
@@ -449,7 +460,7 @@ function M._render()
     for _, frame in ipairs(panel.frames or { panel.frame }) do
       local is_current = frame.id == panel.frame.id
       local marker = is_current and '▸ ' or '  '
-      table.insert(lines, marker .. (frame.name or '?') .. (frame.line and (':' .. frame.line) or ''))
+      table.insert(lines, marker .. M._frame_label(frame))
       table.insert(rows, { kind = 'frame', frame = frame })
       if is_current then current_frame_line = #lines end
     end
@@ -539,13 +550,13 @@ end
 --- @param variable table DAP Variable
 --- @return string
 local function format_value(variable)
-  local v = variable.value or ''
-  v = v:gsub('\n', ' ')
+  local v = vim.trim((variable.value or ''):gsub('\n', ' '))
   if variable.type and variable.type ~= '' then
-    return v .. '  (' .. variable.type .. ')'
+    return (v == '' and '' or (v .. '  ')) .. '(' .. variable.type .. ')'
   end
   return v
 end
+M._format_value = format_value
 
 --- Requests a `variablesReference`'s children and stores them under `name_path`.
 --- @param name_path string
@@ -937,8 +948,8 @@ end
 
 --- @param bufnr integer
 function M.set_keymaps(bufnr)
-  local function map(lhs, rhs, desc)
-    vim.keymap.set('n', lhs, rhs, { buffer = bufnr, desc = desc })
+  local function map(lhs, rhs, desc, modes)
+    vim.keymap.set(modes or 'n', lhs, rhs, { buffer = bufnr, desc = desc })
   end
 
   map('<leader>b', M.toggle_breakpoint, 'IntelliJ: toggle a breakpoint')
@@ -949,8 +960,10 @@ function M.set_keymaps(bufnr)
   map('<leader>di', M.step_into, 'IntelliJ: step into')
   map('<leader>do', M.step_out, 'IntelliJ: step out')
   map('<leader>dq', M.stop, 'IntelliJ: stop the debug session')
-  map('<leader>de', M.evaluate_at_cursor, 'IntelliJ: evaluate the expression at the cursor')
-  map('<leader>dw', M.watch_at_cursor, 'IntelliJ: watch the expression at the cursor')
+  -- Also in Visual mode, where expression_for_evaluate takes the selection. Without the `x` map the
+  -- `d` of the lhs falls through to Vim's own delete and removes the selected text.
+  map('<leader>de', M.evaluate_at_cursor, 'IntelliJ: evaluate the expression at the cursor', { 'n', 'x' })
+  map('<leader>dw', M.watch_at_cursor, 'IntelliJ: watch the expression at the cursor', { 'n', 'x' })
   map('<leader>dv', M.open, 'IntelliJ: open the debug panel (call stack, locals, watches)')
 end
 
