@@ -10,7 +10,7 @@
 
 local M = {}
 
-M.version = '263.4702.0'
+M.version = '263.6379.0'
 
 M.url_template =
   'https://download.jetbrains.com/language-server/intellij-server/{version}/intellij-server-{version}{arch_suffix}.{ext}'
@@ -24,24 +24,24 @@ M.arch_suffix = { aarch64 = '-aarch64', x86_64 = '' }
 --- The size of each archive in bytes, keyed by OS and then by architecture. Drives the progress
 --- percentage; a wrong value only skews the percentage, the checksum still guards the content.
 M.size = {
-  macos = { aarch64 = 375711022, x86_64 = 377667719 },
-  linux = { aarch64 = 383007338, x86_64 = 383998550 },
-  windows = { aarch64 = 358588582, x86_64 = 378972709 },
+  macos = { aarch64 = 378400162, x86_64 = 380357704 },
+  linux = { aarch64 = 385692577, x86_64 = 386687696 },
+  windows = { aarch64 = 361248514, x86_64 = 381634830 },
 }
 
 --- The SHA-256 of each archive, lowercase hex, keyed by OS and then by architecture.
 M.sha256 = {
   macos = {
-    aarch64 = '117a914cbd1c3b8e2d0808429d9a85106ba78d10af34adb34f9daa927e13fbfb',
-    x86_64 = '978cc7aacb6896e36513013215919d947a994edfbb4ad15e0c1cafef48730057',
+    aarch64 = '443157ce085dae947637594ab883692fa7e952ae0c7d0baa6eb917fc91cabdd1',
+    x86_64 = 'e5fff8dfa0af523db053bb9cad46529f862116616e1e0d7b2cbaed032eddef15',
   },
   linux = {
-    aarch64 = '6e92f58b60e9d9eec3c2fbcd64fd9641166497b8e94f053a5f4cc14ccef2220e',
-    x86_64 = '8fa7964736d42e44952d1fea7a5478a3bc6e80e271039ee62a6db6c40fe95970',
+    aarch64 = '7b50afa2d6f08cbd9dc39ccd9bf89c03bb37ff256e25243fc229cf8ec10354ea',
+    x86_64 = '7529cc733d4a020e1c1369183b2f60e135c85b8f074bbf27d1476a5a7b3839c3',
   },
   windows = {
-    aarch64 = '93724efd26bec14d890fc9dea223e17ebcb155f3c23d352e5bac22f7c9dc2d80',
-    x86_64 = 'e69854033db9de8ea132ff4a8451d33f34abc3d1b90778587fc6040582b990da',
+    aarch64 = 'dd160805fbec807c4c9c414f04b67457ec441fd3e3d70bd1a85c321d4b8efbb2',
+    x86_64 = '270d02e08268129022ea5a379ce747f04d91a679213614c597361a7a6d0df41d',
   },
 }
 
