@@ -19,6 +19,8 @@ local status = require('intellij-lsp.git.status')
 local M = {}
 
 local ns = vim.api.nvim_create_namespace('intellij-lsp.git.panel')
+--- The line tints of the diff preview. Separate from `ns`, which each list render clears.
+local preview_ns = vim.api.nvim_create_namespace('intellij-lsp.git.panel.preview')
 
 --- Matches references.lua: below the lag threshold, above a key-repeat interval.
 local DEBOUNCE_MS = 60
@@ -185,6 +187,32 @@ function M._diff_args(entry)
   end
 end
 
+--- The line tints of a unified diff, as IntelliJ's unified viewer paints them.
+---
+--- Only the lines inside a hunk count. The `---` and `+++` lines of a file header start with the same
+--- characters, but they name the files and are not changes.
+--- @param lines string[] `git diff` output
+--- @return table[] { row (0-based), hl }
+function M._line_highlights(lines)
+  local result = {}
+  local in_hunk = false
+  for i, line in ipairs(lines) do
+    if line:sub(1, 2) == '@@' then
+      in_hunk = true
+    elseif line:sub(1, 5) == 'diff ' then
+      in_hunk = false
+    elseif in_hunk then
+      local mark = line:sub(1, 1)
+      if mark == '+' then
+        result[#result + 1] = { row = i - 1, hl = 'IntellijDiffInsertedLine' }
+      elseif mark == '-' then
+        result[#result + 1] = { row = i - 1, hl = 'IntellijDiffDeletedLine' }
+      end
+    end
+  end
+  return result
+end
+
 --- Renders the entry's diff into the editor window.
 --- @param entry table|nil
 local function preview(entry)
@@ -215,6 +243,11 @@ local function preview(entry)
     vim.bo[buf].modifiable = true
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.bo[buf].modifiable = false
+
+    vim.api.nvim_buf_clear_namespace(buf, preview_ns, 0, -1)
+    for _, h in ipairs(M._line_highlights(lines)) do
+      vim.api.nvim_buf_set_extmark(buf, preview_ns, h.row, 0, { line_hl_group = h.hl })
+    end
 
     -- `keepjumps keepalt`, exactly as references.lua does it: nvim_win_set_buf pushes a jumplist
     -- entry per call and `:edit` rewrites the alternate file, so twenty j presses would otherwise

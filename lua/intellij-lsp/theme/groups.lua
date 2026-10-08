@@ -372,10 +372,28 @@ function M.build(p)
     -- -----------------------------------------------------------------------
     -- Diff and VCS
     -- -----------------------------------------------------------------------
-    DiffAdd = { bg = p.diff_add },
-    DiffChange = { bg = p.diff_mod },
+    -- The diff viewer's two levels: a soft tint on a changed line, the full colour on the changed
+    -- words. IntelliJ does not embolden either.
+    DiffAdd = { bg = p.diff_inserted_line },
+    DiffChange = { bg = p.diff_modified_line },
     DiffDelete = { fg = p.diff_del },
-    DiffText = { bg = p.diff_mod, bold = true },
+    DiffText = { bg = p.diff_modified },
+    DiffTextAdd = { bg = p.diff_inserted },
+
+    -- The old pane of a two-pane diff. Neovim paints a line that only the old side has as DiffAdd,
+    -- but IntelliJ paints a deletion grey. git/diff.lua remaps DiffAdd and DiffTextAdd to these
+    -- groups in that window only.
+    IntellijDiffDeleted = { bg = p.diff_deleted_line },
+    IntellijDiffDeletedText = { bg = p.diff_deleted },
+    -- The filler lines that keep the panes aligned. IntelliJ draws no text there, so the fill
+    -- character stays dim.
+    IntellijDiffFiller = { fg = p.separator },
+    -- A fold of unchanged lines. IntelliJ draws it as a bar in DIFF_SEPARATORS_BACKGROUND.
+    IntellijDiffFold = { fg = p.folded_fg, bg = p.diff_separator },
+    -- The pane headers. The plain text is the revision and path, and the dimmed text is the
+    -- `(read-only)` note.
+    IntellijDiffTitle = { fg = p.fg, bg = p.breadcrumb_current_bg },
+    IntellijDiffTitleMeta = { fg = p.not_used, bg = p.breadcrumb_current_bg },
 
     -- The `Added`/`Changed`/`Removed` trio is what gitsigns-style plugins pick up; IntelliJ's
     -- FILESTATUS_* colours are the right source for them.

@@ -1,4 +1,4 @@
-# IntelliJ Language Server for Neovim (Java + Kotlin)
+# IntelliJ LSP for Neovim — ⚠️ EXPERIMENTAL ⚠️
 
 A Neovim client for the `intellij-server` bundle: indexing, navigation, diagnostics, completion,
 quick fixes and refactorings, type and call hierarchy, formatting, file templates, run/debug and
@@ -194,8 +194,15 @@ default); with it off, those rows are listed but cannot be opened.
 
 ### `:IntellijGitDiff`
 
-Neovim's own diff mode: `]c` / `[c` move between hunks and `do` takes the other side of a hunk.
-The revision pane is read-only, so `dp` is intercepted and explains why.
+Neovim's own diff mode: `]c` / `[c` (or IntelliJ's `F7` / `Shift+F7`) move between hunks and
+`do` takes the other side of a hunk. The revision pane is read-only, so `dp` is intercepted and
+explains why.
+
+The diff panes use the colours of IntelliJ's diff viewer. A deleted line is grey in the old pane,
+and the changed words inside a line get a stronger colour. Each pane has a header with its
+revision, and unchanged lines fold into one `⋯ N unchanged lines` bar. When your config does not set
+'diffopt', the first diff switches it from `inline:char` to `inline:word`, because IntelliJ
+highlights by words.
 
 ### `:IntellijGitLog`
 

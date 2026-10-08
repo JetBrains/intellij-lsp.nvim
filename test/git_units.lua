@@ -757,6 +757,142 @@ for _, g in ipairs({ 'IntellijGitLogHash', 'IntellijGitBranchCurrent', 'Intellij
   check(('%s is declared centrally'):format(g), highlights.GROUPS[g] ~= nil)
 end
 
+-- The remap groups of the two-pane diff must resolve under a foreign scheme too, or the panes lose
+-- their colour there.
+for _, g in ipairs({ 'IntellijDiffDeleted', 'IntellijDiffDeletedText', 'IntellijDiffFiller',
+                     'IntellijDiffFold', 'IntellijDiffTitle', 'IntellijDiffTitleMeta',
+                     'IntellijDiffInsertedLine', 'IntellijDiffDeletedLine' }) do
+  check(('%s is declared centrally'):format(g), highlights.GROUPS[g] ~= nil)
+  check(('%s resolves after setup'):format(g),
+    next(vim.api.nvim_get_hl(0, { name = g, link = false })) ~= nil)
+end
+
+-- -------------------------------------------------------------------------------------------------
+-- Two-pane diff styling
+-- -------------------------------------------------------------------------------------------------
+
+local diff = require('intellij-lsp.git.diff')
+do
+  vim.cmd('tabnew')
+  local new_win = vim.api.nvim_get_current_win()
+  local new_buf = vim.api.nvim_get_current_buf()
+  -- A user's own values, which must survive the diff.
+  vim.wo[new_win].winhighlight = 'Normal:Comment'
+  vim.keymap.set('n', '<S-F7>', '<Nop>', { buffer = new_buf, desc = 'user map' })
+  vim.cmd('leftabove vsplit')
+  local old_win = vim.api.nvim_get_current_win()
+  local old_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(old_win, old_buf)
+  vim.cmd('diffthis')
+  vim.api.nvim_win_call(new_win, function() vim.cmd('diffthis') end)
+
+  diff.style_panes(old_win, new_win, {
+    old = { name = 'HEAD · src/100%.txt', readonly = true },
+    new = { name = 'Your version' },
+  })
+  local old_hl = vim.wo[old_win].winhighlight
+  local new_hl = vim.wo[new_win].winhighlight
+  -- Neovim paints a line that only the old side has as DiffAdd. In the old pane that is a deletion.
+  check('old pane shows an old-only line as deleted',
+    old_hl:find('DiffAdd:IntellijDiffDeleted', 1, true) ~= nil, old_hl)
+  check('old pane shows an old-only word as deleted',
+    old_hl:find('DiffTextAdd:IntellijDiffDeletedText', 1, true) ~= nil, old_hl)
+  check('new pane keeps DiffAdd as an insertion', new_hl:find('DiffAdd:', 1, true) == nil, new_hl)
+  check('new pane keeps the user value', new_hl:find('Normal:Comment', 1, true) == 1, new_hl)
+  for _, entry in ipairs({ 'DiffDelete:IntellijDiffFiller', 'Folded:IntellijDiffFold',
+                           'WinBar:IntellijDiffTitle', 'WinBarNC:IntellijDiffTitle' }) do
+    check(('%s in both panes'):format(entry),
+      old_hl:find(entry, 1, true) ~= nil and new_hl:find(entry, 1, true) ~= nil, old_hl)
+  end
+  -- The global value stays the base, or `eob` and the rest fall back to Neovim's defaults.
+  local fill = vim.wo[new_win].fillchars
+  check('global fillchars stay the base',
+    vim.go.fillchars == '' or fill:find(vim.go.fillchars, 1, true) == 1, fill)
+  local parsed = vim.api.nvim_win_call(new_win, function() return vim.opt_local.fillchars:get() end)
+  check('Neovim parses the filler character', parsed.diff == '╱', vim.inspect(parsed))
+  check('Neovim parses the fold character', parsed.fold == ' ', vim.inspect(parsed))
+
+  -- `:diffthis` sets a fold column of 2, and IntelliJ shows none.
+  check('no fold column', vim.wo[old_win].foldcolumn == '0', vim.wo[old_win].foldcolumn)
+  check('foldtext is ours', vim.wo[new_win].foldtext:find('intellij-lsp.git.diff', 1, true) ~= nil,
+    vim.wo[new_win].foldtext)
+  vim.v.foldstart, vim.v.foldend = 10, 51
+  check('foldtext counts the lines', diff.foldtext():find('42 unchanged lines', 1, true) ~= nil,
+    diff.foldtext())
+  vim.v.foldstart, vim.v.foldend = 7, 7
+  check('foldtext singular', diff.foldtext():find('1 unchanged line$') ~= nil, diff.foldtext())
+  -- Evaluated the way Neovim evaluates it, so a broken `v:lua` expression fails here.
+  vim.v.foldstart, vim.v.foldend = 1, 3
+  check('foldtext expression evaluates',
+    vim.fn.eval(vim.wo[new_win].foldtext) == diff.foldtext())
+
+  -- Pane headers. A `%` in a path starts a 'winbar' item unless it is escaped.
+  local bar = vim.wo[old_win].winbar
+  check('old header names the revision', bar:find('HEAD · src/100%%.txt', 1, true) ~= nil, bar)
+  check('old header notes read-only', bar:find('(read-only)', 1, true) ~= nil, bar)
+  check('new header', vim.wo[new_win].winbar:find('Your version', 1, true) ~= nil,
+    vim.wo[new_win].winbar)
+  check('new header has no read-only note',
+    vim.wo[new_win].winbar:find('read-only', 1, true) == nil, vim.wo[new_win].winbar)
+  local evaluated = vim.api.nvim_eval_statusline(bar, { winid = old_win, use_winbar = true }).str
+  check('header renders the path', evaluated:find('src/100%.txt', 1, true) ~= nil, evaluated)
+
+  -- IntelliJ's next and previous difference keys.
+  local function bufmap(buf, key)
+    return vim.api.nvim_buf_call(buf, function() return vim.fn.maparg(key, 'n', false, true) end)
+  end
+  check('F7 is next difference', bufmap(new_buf, '<F7>').rhs == ']c',
+    vim.inspect(bufmap(new_buf, '<F7>')))
+  check('F7 in the old pane', bufmap(old_buf, '<F7>').rhs == ']c')
+  check('S-F7 is previous difference', bufmap(old_buf, '<S-F7>').rhs == '[c')
+  check('a user buffer map is not replaced', bufmap(new_buf, '<S-F7>').desc == 'user map',
+    vim.inspect(bufmap(new_buf, '<S-F7>')))
+
+  -- A re-render styles the same windows again. That must not stack the entries.
+  diff.style_panes(old_win, new_win)
+  check('styling twice does not stack entries', vim.wo[new_win].winhighlight == new_hl,
+    vim.wo[new_win].winhighlight)
+
+  diff.unstyle_pane(new_win)
+  check('unstyle restores the user winhighlight', vim.wo[new_win].winhighlight == 'Normal:Comment',
+    vim.wo[new_win].winhighlight)
+  -- 'foldtext' is a window option with a default, and the other two are empty until set.
+  for name, before in pairs({ fillchars = '', foldtext = 'foldtext()', winbar = '' }) do
+    local value = vim.api.nvim_get_option_value(name, { win = new_win, scope = 'local' })
+    check(('unstyle restores %s'):format(name), value == before, value)
+  end
+  check('unstyle removes F7', next(bufmap(new_buf, '<F7>')) == nil,
+    vim.inspect(bufmap(new_buf, '<F7>')))
+  check('unstyle keeps the user map', bufmap(new_buf, '<S-F7>').desc == 'user map')
+  diff.unstyle_pane(new_win)
+  check('unstyle twice is harmless', vim.wo[new_win].winhighlight == 'Normal:Comment')
+  vim.cmd('tabclose')
+end
+
+-- The unified preview in the status panel tints the changed lines, and only those inside a hunk.
+do
+  local tints = panel._line_highlights({
+    'diff --git a/x b/x',
+    '--- a/x',
+    '+++ b/x',
+    '@@ -1,2 +1,2 @@',
+    ' same',
+    '-old',
+    '+new',
+    '\\ No newline at end of file',
+    'diff --git a/y b/y',
+    '--- a/y',
+    '+++ b/y',
+  })
+  check('unified preview tints two lines', #tints == 2, vim.inspect(tints))
+  check('deleted line tint',
+    tints[1] and tints[1].row == 5 and tints[1].hl == 'IntellijDiffDeletedLine',
+    vim.inspect(tints[1]))
+  check('inserted line tint',
+    tints[2] and tints[2].row == 6 and tints[2].hl == 'IntellijDiffInsertedLine',
+    vim.inspect(tints[2]))
+end
+
 -- Branch names decorating a commit, for switching branches from inside the log.
 --
 -- `parse_refs` keeps the `HEAD -> ` arrow for display, so it has to be stripped here; and three ref

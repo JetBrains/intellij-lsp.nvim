@@ -188,6 +188,19 @@ M.diff_del = '#868A91'
 --- DIFF_SEPARATORS_BACKGROUND
 M.diff_separator = '#2B2D30'
 
+--- DIFF_INSERTED / DIFF_MODIFIED / DIFF_DELETED, inherited from Darcula. These are the diff viewer's
+--- colours. The *_LINES_COLOR values above are the gutter stripes, which are too loud for a whole line.
+M.diff_inserted = '#294436'
+M.diff_modified = '#385570'
+M.diff_deleted = '#484A4A'
+
+--- The line tints of the diff viewer. IntelliJ paints a changed line with
+--- `ColorUtil.mix(colour, bg, 0.6)` and keeps the full colour for the changed words inside it
+--- (TextDiffTypeFactory.getIgnoredColor). Computed here against `bg`.
+M.diff_inserted_line = '#1F2B26'
+M.diff_modified_line = '#25323E'
+M.diff_deleted_line = '#2C2D2E'
+
 --- FILESTATUS_* -- the colours IntelliJ uses for file names in trees and tabs
 M.status_added = '#73BD79'
 M.status_modified = '#70AEFF'

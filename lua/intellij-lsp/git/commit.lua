@@ -117,8 +117,16 @@ local function preview(s, file)
       session.render_diff_preview(s,
         -- Empty tables rather than nil: an added file needs an empty left pane so every line reads as
         -- an addition, and a deleted file an empty right one.
-        { name = ('intellij-git://%s^/%s'):format(short, parent_path), lines = before or {} },
-        { name = ('intellij-git://%s/%s'):format(short, file.path), lines = after or {} },
+        {
+          name = ('intellij-git://%s^/%s'):format(short, parent_path),
+          title = ('%s^ · %s'):format(short, parent_path),
+          lines = before or {},
+        },
+        {
+          name = ('intellij-git://%s/%s'):format(short, file.path),
+          title = ('%s · %s'):format(short, file.path),
+          lines = after or {},
+        },
         diff.filetype_for(file.path))
     end)
   end)

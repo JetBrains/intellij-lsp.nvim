@@ -300,8 +300,8 @@ end
 --- Returns false when the session or the preview area went away, so a stale async response is dropped
 --- rather than painting into a closed layout.
 --- @param s IntellijGitSession
---- @param left { name: string, lines: string[] }
---- @param right { name: string, lines: string[] }
+--- @param left { name: string, title?: string, lines: string[] } `title` is the pane header
+--- @param right { name: string, title?: string, lines: string[] }
 --- @param filetype string
 --- @return boolean
 function M.render_diff_preview(s, left, right, filetype)
@@ -372,6 +372,10 @@ function M.render_diff_preview(s, left, right, filetype)
       pcall(function() vim.cmd('normal! ]c') end)
     end)
   end
+  require('intellij-lsp.git.diff').style_panes(lwin, rwin, {
+    old = left.title and { name = left.title, readonly = true },
+    new = right.title and { name = right.title, readonly = true },
+  })
 
   return true
 end
@@ -388,6 +392,7 @@ function M.close_diff_preview(s)
   end
   if s.diff_right_win and vim.api.nvim_win_is_valid(s.diff_right_win) then
     pcall(vim.api.nvim_win_call, s.diff_right_win, function() vim.cmd('diffoff') end)
+    require('intellij-lsp.git.diff').unstyle_pane(s.diff_right_win)
   end
 
   -- Order matters, and getting it wrong destroys the caller's window. Deleting a buffer closes every

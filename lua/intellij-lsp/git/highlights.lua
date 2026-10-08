@@ -80,6 +80,20 @@ M.GROUPS = {
   IntellijGitBranchRemote = 'Comment',
   IntellijGitBranchMeta = 'Comment',
   IntellijGitBranchSection = 'Statement',
+
+  -- Two-pane diff. `diff.lua` remaps the diff groups to these in one window only. Under a foreign
+  -- scheme the targets are the groups that already carry the meaning: a deletion is DiffDelete, and
+  -- the filler is DiffDelete because Neovim paints it with that group anyway.
+  IntellijDiffDeleted = 'DiffDelete',
+  IntellijDiffDeletedText = 'DiffText',
+  IntellijDiffFiller = 'DiffDelete',
+  IntellijDiffFold = 'Folded',
+  IntellijDiffTitle = 'WinBar',
+  IntellijDiffTitleMeta = 'WinBarNC',
+
+  -- The unified diff in the status panel's preview. The same line tints as the two-pane diff.
+  IntellijDiffInsertedLine = 'DiffAdd',
+  IntellijDiffDeletedLine = 'IntellijDiffDeleted',
 }
 
 local function define()

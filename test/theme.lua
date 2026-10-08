@@ -136,6 +136,31 @@ check('qfFileName is set, not left linked to Directory',
   vim.inspect(vim.api.nvim_get_hl(0, { name = 'qfFileName', link = true })))
 vim.cmd('cclose')
 
+-- Diff mode uses the diff viewer's DIFF_* colours: a tint on the line, the full colour on the words.
+-- The *_LINES_COLOR gutter stripes (#549159, #375FAD) were here before and painted far too loud.
+check('DiffAdd is the inserted line tint', bg('DiffAdd') == '#1F2B26', bg('DiffAdd'))
+check('DiffChange is the modified line tint', bg('DiffChange') == '#25323E', bg('DiffChange'))
+check('DiffText is DIFF_MODIFIED', bg('DiffText') == '#385570', bg('DiffText'))
+check('DiffText is not bold', hl('DiffText').bold == nil, vim.inspect(hl('DiffText')))
+check('DiffTextAdd is DIFF_INSERTED', bg('DiffTextAdd') == '#294436', bg('DiffTextAdd'))
+check('old-pane deleted line is grey', bg('IntellijDiffDeleted') == '#2C2D2E', bg('IntellijDiffDeleted'))
+check('old-pane deleted word is DIFF_DELETED',
+  bg('IntellijDiffDeletedText') == '#484A4A', bg('IntellijDiffDeletedText'))
+check('diff filler is dim', fg('IntellijDiffFiller') == '#43454A', fg('IntellijDiffFiller'))
+check('diff fold is DIFF_SEPARATORS_BACKGROUND', bg('IntellijDiffFold') == '#2B2D30',
+  bg('IntellijDiffFold'))
+-- Neovim's own WinBar is near black under this scheme, so the pane header sets its own colour.
+check('diff header background', bg('IntellijDiffTitle') == '#2B2D30', bg('IntellijDiffTitle'))
+check('diff header text', fg('IntellijDiffTitle') == '#BCBEC4', fg('IntellijDiffTitle'))
+check('diff header note is dimmed', fg('IntellijDiffTitleMeta') == '#6F737A',
+  fg('IntellijDiffTitleMeta'))
+-- The unified preview links to the two-pane tints, through git/highlights.lua.
+require('intellij-lsp.git.highlights').setup()
+check('unified inserted line', bg('IntellijDiffInsertedLine') == '#1F2B26',
+  bg('IntellijDiffInsertedLine'))
+check('unified deleted line', bg('IntellijDiffDeletedLine') == '#2C2D2E',
+  bg('IntellijDiffDeletedLine'))
+
 -- The feature's own groups, which live in references.lua rather than the scheme so they degrade for
 -- users who never opted in. Under islands-dark they resolve to IntelliJ's Find-Usages greens.
 require('intellij-lsp.references')

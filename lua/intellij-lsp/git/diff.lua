@@ -62,6 +62,150 @@ local function map_transfer_keys(work_buf, rev_buf)
   end
 end
 
+--- Window options that `style_panes` changes. Saved per window, so `unstyle_pane` can put the user's
+--- own values back on a window the plugin did not create.
+---
+--- 'foldcolumn' is not here: `:diffthis` sets it and `:diffoff` restores it.
+local PANE_OPTIONS = { 'winhighlight', 'fillchars', 'foldtext', 'winbar' }
+
+--- The keys of IntelliJ's next and previous difference.
+local NAV_KEYS = { ['<F7>'] = ']c', ['<S-F7>'] = '[c' }
+
+--- The highlight remap of both panes.
+---
+--- The filler lines get a dim colour. The folds of unchanged lines get the diff separator colour.
+--- The pane header gets its own group, because `WinBar` in most schemes does not match the editor.
+local PANE_HL = 'DiffDelete:IntellijDiffFiller,Folded:IntellijDiffFold,'
+  .. 'WinBar:IntellijDiffTitle,WinBarNC:IntellijDiffTitle'
+
+--- The extra highlight remap of the old pane.
+---
+--- Neovim paints a line that only one side has as DiffAdd, on whichever side has it. In the old pane
+--- that line is a deletion, which IntelliJ paints grey. The same applies to a deleted word, which
+--- Neovim paints as DiffTextAdd.
+local OLD_PANE_HL = 'DiffAdd:IntellijDiffDeleted,DiffTextAdd:IntellijDiffDeletedText'
+
+--- The fill characters of the panes. Neovim's default `-` on a filler line reads as text, and
+--- IntelliJ draws no text there. A fold line has no fill, so it reads as one separator bar.
+local FILLCHARS = 'diff:╱,fold: '
+
+--- @param base string
+--- @param extra string
+--- @return string
+local function join_option(base, extra)
+  if base == '' then return extra end
+  return base .. ',' .. extra
+end
+
+--- Switches the inline diff from characters to words, as IntelliJ highlights by words.
+---
+--- 'diffopt' is global. It changes only while the user has not set it, so a deliberate choice in
+--- the user's config always wins.
+local function prefer_word_diff()
+  if vim.api.nvim_get_option_info2('diffopt', {}).was_set then return end
+  vim.opt.diffopt:remove('inline:char')
+  vim.opt.diffopt:append('inline:word')
+end
+
+--- The text of a fold of unchanged lines. Called by 'foldtext'.
+--- @return string
+function M.foldtext()
+  local count = vim.v.foldend - vim.v.foldstart + 1
+  return ('  ⋯ %d unchanged %s'):format(count, count == 1 and 'line' or 'lines')
+end
+
+--- The 'winbar' value of a pane header.
+--- @param title { name: string, readonly?: boolean }
+--- @return string
+function M.winbar(title)
+  -- `%` starts an item in 'winbar', so a path that holds one must escape it.
+  local text = '%#IntellijDiffTitle# ' .. title.name:gsub('%%', '%%%%')
+  if title.readonly then
+    text = text .. ' %#IntellijDiffTitleMeta#(read-only)'
+  end
+  return text
+end
+
+--- @param win integer
+--- @param remap string the 'winhighlight' entries to add
+--- @param title { name: string, readonly?: boolean }|nil
+local function style_pane(win, remap, title)
+  if not vim.api.nvim_win_is_valid(win) then return end
+  local opts = { win = win, scope = 'local' }
+
+  -- Saved once. A re-render styles the same window again, and saving then would capture our own
+  -- values as the user's.
+  local saved = vim.w[win].intellij_diff_saved
+  if not saved then
+    saved = { options = {} }
+    for _, name in ipairs(PANE_OPTIONS) do
+      saved.options[name] = vim.api.nvim_get_option_value(name, opts)
+    end
+
+    -- The keys are buffer-local, and the working-tree buffer is the user's. A buffer-local mapping
+    -- that the user made stays, and `unstyle_pane` removes only the keys mapped here.
+    local buf = vim.api.nvim_win_get_buf(win)
+    saved.keys = {}
+    for key, rhs in pairs(NAV_KEYS) do
+      -- `maparg` reads the current buffer, which is not always `buf`.
+      local existing = vim.api.nvim_buf_call(buf, function()
+        return vim.fn.maparg(key, 'n', false, true)
+      end)
+      if existing.buffer ~= 1 then
+        vim.keymap.set('n', key, rhs,
+          { buffer = buf, desc = 'IntelliJ git: go to the next or previous difference' })
+        saved.keys[#saved.keys + 1] = key
+      end
+    end
+    saved.keys_buf = buf
+    vim.w[win].intellij_diff_saved = saved
+  end
+
+  local o = saved.options
+  vim.api.nvim_set_option_value('winhighlight', join_option(o.winhighlight, remap), opts)
+  -- A local 'fillchars' replaces the global value as a whole. The base is therefore the global value
+  -- when the window has no local one, or `eob` and the rest fall back to Neovim's defaults.
+  local fill = o.fillchars ~= '' and o.fillchars or vim.go.fillchars
+  vim.api.nvim_set_option_value('fillchars', join_option(fill, FILLCHARS), opts)
+  -- After `:diffthis`, which sets a fold column of 2. IntelliJ shows no fold column.
+  vim.api.nvim_set_option_value('foldcolumn', '0', opts)
+  vim.api.nvim_set_option_value('foldtext', "v:lua.require'intellij-lsp.git.diff'.foldtext()", opts)
+  if title then
+    vim.api.nvim_set_option_value('winbar', M.winbar(title), opts)
+  end
+end
+
+--- Gives a two-pane diff the look of IntelliJ's diff viewer.
+---
+--- Safe to call again on the same windows, which the commit detail preview does on every step.
+--- @param old_win integer the pane with the older revision, on the left
+--- @param new_win integer the pane with the newer revision or the working tree, on the right
+--- @param titles { old?: table, new?: table }|nil the pane headers, see `M.winbar`
+function M.style_panes(old_win, new_win, titles)
+  titles = titles or {}
+  prefer_word_diff()
+  style_pane(old_win, join_option(PANE_HL, OLD_PANE_HL), titles.old)
+  style_pane(new_win, PANE_HL, titles.new)
+end
+
+--- Puts back the window options and the keys that `style_panes` changed. Does nothing on a window
+--- it did not style.
+--- @param win integer
+function M.unstyle_pane(win)
+  if not vim.api.nvim_win_is_valid(win) then return end
+  local saved = vim.w[win].intellij_diff_saved
+  if not saved then return end
+  for name, value in pairs(saved.options) do
+    vim.api.nvim_set_option_value(name, value, { win = win, scope = 'local' })
+  end
+  if saved.keys_buf and vim.api.nvim_buf_is_valid(saved.keys_buf) then
+    for _, key in ipairs(saved.keys or {}) do
+      pcall(vim.keymap.del, 'n', key, { buffer = saved.keys_buf })
+    end
+  end
+  vim.w[win].intellij_diff_saved = nil
+end
+
 --- Path of `bufnr` relative to the repository root.
 ---
 --- git needs a repo-relative path for `show <rev>:<path>`, and `--show-prefix` is the only correct way
@@ -143,11 +287,17 @@ function M.open(rev)
 
     -- The working-tree pane is the current window, so diff mode is entered there first and the
     -- revision opens to its left -- older on the left, matching every other diff tool.
+    local work_win = vim.api.nvim_get_current_win()
     vim.cmd('diffthis')
     vim.cmd('leftabove vsplit')
     local win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(win, scratch)
     vim.cmd('diffthis')
+    M.style_panes(win, work_win, {
+      old = { name = ('%s · %s'):format(rev and rev ~= '' and rev or 'Index', rel), readonly = true },
+      -- IntelliJ's own title for the working-tree side.
+      new = { name = 'Your version' },
+    })
 
     -- Leaves the cursor in the working-tree pane: that is the side the user can edit, and landing in
     -- a read-only pane makes the first keystroke fail for no visible reason.
@@ -165,6 +315,8 @@ function M.open(rev)
       once = true,
       desc = 'IntelliJ git: leave diff mode when the revision pane closes',
       callback = function()
+        -- The working-tree window is the user's own, so it gets its highlights back too.
+        M.unstyle_pane(work_win)
         for _, w in ipairs(vim.api.nvim_list_wins()) do
           if vim.api.nvim_win_get_buf(w) == bufnr then
             pcall(vim.api.nvim_win_call, w, function() vim.cmd('diffoff') end)
@@ -278,6 +430,10 @@ function M.open_commit_file(root, hash, file)
       local lwin = vim.api.nvim_get_current_win()
       vim.api.nvim_win_set_buf(lwin, lbuf)
       vim.cmd('diffthis')
+      M.style_panes(lwin, rwin, {
+        old = { name = ('%s^ · %s'):format(short, parent_path), readonly = true },
+        new = { name = ('%s · %s'):format(short, path), readonly = true },
+      })
 
       -- Cursor on the right: that is the commit itself, the thing being looked at. Left is context.
       vim.api.nvim_set_current_win(rwin)
