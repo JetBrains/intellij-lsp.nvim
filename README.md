@@ -6,7 +6,8 @@ git for Java and Kotlin from a single server. Requires Neovim 0.11+.
 
 The plugin itself is Apache 2.0 licensed. The `intellij-server` bundle it downloads is a separate
 JetBrains product with its own license (`EULA.txt` inside the bundle), which you accept with
-`accept_eula = true`.
+`accept_eula = true`. The server needs an IntelliJ IDEA Ultimate subscription once its free 30-day
+trial ends, and the current EAP builds of the server stop working after the same 30 days.
 
 ## Project status
 
