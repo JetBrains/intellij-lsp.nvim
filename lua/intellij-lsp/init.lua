@@ -137,6 +137,9 @@ local function start_for_buffer(bufnr)
     return
   end
 
+  -- Virtual diff snapshots must not attach historical contents to the live workspace.
+  if not client.is_source_buffer(bufnr) then return end
+
   -- Attach to a server that already covers this file, whatever root it was started with.
   local existing = name ~= '' and client.find_ancestor_client(name) or nil
   if existing then

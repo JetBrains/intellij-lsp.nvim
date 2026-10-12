@@ -117,11 +117,24 @@ function M.build_root(dir)
   return dir
 end
 
+--- Whether a buffer represents an ordinary source file rather than a virtual snapshot.
+--- @param bufnr integer
+--- @return boolean
+function M.is_source_buffer(bufnr)
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  -- Diffview index buffers can have empty buftype, so also check the name.
+  -- Searching diffview:// paths can find cwd's pom.xml as root ".", producing file://.
+  -- Keep Windows drive paths while excluding URI schemes.
+  local virtual = name:match('^%a[%w+.-]*:') and not name:match('^%a:[/\\]')
+  return vim.bo[bufnr].buftype == '' and name ~= '' and not virtual
+end
+
 --- Root of the build that the buffer's file belongs to: the nearest project marker, widened by
 --- `build_root` from a module to the build that aggregates it.
 --- @param bufnr integer
 --- @return string|nil
 function M.find_root(bufnr)
+  if not M.is_source_buffer(bufnr) then return nil end
   local name = vim.api.nvim_buf_get_name(bufnr)
   if name == '' then return nil end
   local start = vim.fs.dirname(name)

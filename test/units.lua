@@ -849,6 +849,31 @@ do
   start_for_buffer(orphan)
   check('a library buffer never starts a server of its own', started == 0, started)
 
+  -- Diffview's stage-0 buffer has empty buftype, unlike its read-only revision buffers.
+  -- Both must skip root detection and attachment, even with pom.xml in cwd.
+  local real_ancestor = client.find_ancestor_client
+  client.find_ancestor_client = function() return { id = 4242 } end
+  attached = nil
+  for _, case in ipairs({
+    { 'diffview://' .. proj .. '/.git/HEAD/src/Main.java', 'nofile' },
+    { 'diffview://' .. proj .. '/.git/:0:/src/Main.java', '' },
+    { 'fugitive://' .. proj .. '/.git/0/src/Main.java', '' },
+    { proj .. '/Scratch.java', 'nofile' },
+  }) do
+    local buf = vim.api.nvim_create_buf(false, false)
+    vim.api.nvim_buf_set_name(buf, case[1])
+    vim.bo[buf].buftype = case[2]
+    check('virtual/non-file buffer has no root: ' .. case[1], client.find_root(buf) == nil)
+    start_for_buffer(buf)
+    check('virtual/non-file buffer neither starts nor attaches: ' .. case[1], started == 0 and attached == nil)
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end
+  client.find_ancestor_client = real_ancestor
+  local source = vim.api.nvim_create_buf(false, false)
+  vim.api.nvim_buf_set_name(source, proj .. '/Main.java')
+  check('ordinary Java buffer retains its Maven root', client.find_root(source) == proj)
+  vim.api.nvim_buf_delete(source, { force = true })
+
   vim.cmd('cd ' .. vim.fn.fnameescape(old_cwd))
   vim.lsp.start, vim.lsp.buf_attach_client, vim.lsp.get_client_by_id = real_start, real_attach, real_by_id
 end
