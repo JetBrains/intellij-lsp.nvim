@@ -5,9 +5,9 @@ quick fixes and refactorings, type and call hierarchy, formatting, file template
 git for Java and Kotlin from a single server. Requires Neovim 0.11+.
 
 The plugin itself is Apache 2.0 licensed. The `intellij-server` bundle it downloads is a separate
-JetBrains product with its own license (`EULA.txt` inside the bundle), which you accept with
-`accept_eula = true`. The server needs an IntelliJ IDEA Ultimate subscription once its free 30-day
-trial ends, and the current EAP builds of the server stop working after the same 30 days.
+JetBrains product with its own license (`EULA.txt` inside the bundle), which the plugin asks you to
+accept on first start. Every server build starts with a free 30-day trial; after that it needs an
+IntelliJ IDEA Ultimate subscription.
 
 ## Project status
 
@@ -17,14 +17,18 @@ Expect rough edges: features may be incomplete or broken, and configuration opti
 key mappings can change between releases without a deprecation period. Please report what breaks,
 but do not depend on it for daily work yet.
 
+The `intellij-server` bundle is now released and requires a license, so the plugin supports
+licensing (trial, JetBrains Account, activation code, license server) even though the plugin
+itself is still pre-alpha.
+
 At this stage we can't make promises about the roadmap or the pace of development, so features and
 release timing may shift as the project evolves.
 
 ## Quick start
 
-The only option you have to set is `accept_eula`. With nothing else configured the plugin downloads
-the published `intellij-server` bundle for your platform on first start, detects Maven, Gradle,
-Bazel or JPS projects, and analyzes your code with the JDK your project configures.
+No option is required. With nothing configured the plugin downloads the published
+`intellij-server` bundle for your platform on first start, detects Maven, Gradle, Bazel or JPS
+projects, and analyzes your code with the JDK your project configures.
 
 With lazy.nvim, save this as a new file `lua/plugins/intellij-lsp.lua` inside your Neovim config
 directory (if your lazy.nvim setup imports the `plugins` directory), or add it as one more entry to
@@ -36,9 +40,7 @@ directory is what `:echo stdpath('config')` prints: `~/.config/nvim` on macOS an
 {
   'JetBrains/intellij-lsp.nvim',
   dependencies = { 'mfussenegger/nvim-dap' }, -- optional: run and debug
-  opts = {
-    accept_eula = true, -- read EULA.txt in the downloaded bundle first
-  },
+  opts = {},
 }
 ```
 
@@ -52,13 +54,47 @@ replace that table with this one:
 
 ```lua
 opts = {
-  accept_eula = true,
   server_path = '~/intellij-server/bin/intellij-server', -- use your own bundle instead of downloading
   default_sdk = '/path/to/jdk-21',                       -- JDK for projects that do not configure their own
 }
 ```
 
 Then open a Java or Kotlin file and run `:checkhealth intellij-lsp`.
+
+### First start
+
+Before the first server starts, the plugin asks for your region, shows the bundle's EULA (`a`
+accepts), and asks whether to send usage statistics. The answers are stored and asked once;
+`:IntellijLspLicense setup` asks again.
+
+To skip the screens, for dotfiles shared across machines or for Neovim without a UI (`--headless`,
+CI), set all three:
+
+```lua
+opts = {
+  accept_eula = true,    -- after reading EULA.txt in the downloaded bundle
+  region = 'europe',     -- africa, americas, apac, china, europe, middle_east, oceania
+  data_sharing = 'none', -- full, anonymous, none
+},
+```
+
+Headless Neovim cannot show the screens: it starts no server without `accept_eula = true`, and uses
+the server's defaults (no region, no usage statistics) for the other two unless they are set.
+
+Without a license, the server then starts but answers nothing, and the plugin offers to activate one
+once per session: sign in with a JetBrains Account, start the 30-day trial, enter an activation
+code, or use a license server. `:IntellijLspLicense` offers it again, or once licensed shows the
+license and lets you change, remove or sign out; `:IntellijLspLicense <Tab>` lists the subcommands.
+Over SSH the sign-in runs in a terminal, where you paste the code the sign-in page shows
+(`:IntellijLspLicense login --code`). A license that is lost, enters its grace period or is about
+to end (a trial with 7 days, then 1 day left) is announced once, and
+`require('intellij-lsp').license()` puts it in your statusline (`IJ trial 5d`, `IJ unlicensed`).
+Without a license, a note at the end of each buffer's first line says so, `grr`, `gd` and `K` open the
+activation float naming what you asked for, and `gra` offers one action: activate a license.
+
+`:checkhealth intellij-lsp` shows each running server's license and the consent it was started
+with; `:help intellij-lsp-licensing` covers the rest, including the environment variables that
+license the server from outside.
 
 ## Setup
 
@@ -75,7 +111,10 @@ require('intellij-lsp').setup({
   -- Server ------------------------------------------------------------------
   server_path = nil,              -- path to bin/intellij-server; nil downloads the published bundle
   server_download = true,         -- download and cache the bundle when server_path is unset
-  accept_eula = false,            -- accept the bundle's EULA.txt (required for released bundles)
+  accept_eula = nil,              -- true accepts the bundle's EULA.txt without asking; nil asks
+  region = nil,                   -- africa|americas|apac|china|europe|middle_east|oceania; nil asks
+  data_sharing = nil,             -- usage statistics: "full"|"anonymous"|"none"; nil asks
+  license_hint = true,            -- without a license, say so at the end of each buffer's first line
   jvm_args = nil,                 -- extra JVM options for the server process
   filetypes = { 'java', 'kotlin' }, -- filetypes that start the server
 

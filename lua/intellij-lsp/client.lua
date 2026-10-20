@@ -1,6 +1,7 @@
 --- LSP client configuration.
 
 local launch = require('intellij-lsp.launch')
+local licensing = require('intellij-lsp.licensing')
 local progress = require('intellij-lsp.progress')
 local versions = require('intellij-lsp.versions')
 
@@ -194,8 +195,10 @@ function M.find_ancestor_client(path)
   -- which for this server is seconds of JVM start. A file opened in that window would miss the
   -- eagerly started client and start a second server on its own module root. `buf_attach_client`
   -- accepts an uninitialized client and sends `didOpen` once it is ready.
+  -- A stopping client is still listed until its process exits, which for this server can outlast
+  -- the restart's delay; attaching to it would leave the buffer with no server.
   for _, c in ipairs(vim.lsp.get_clients({ name = M.NAME, _uninitialized = true })) do
-    local root = c.config.root_dir and vim.fs.normalize(c.config.root_dir)
+    local root = not c:is_stopped() and c.config.root_dir and vim.fs.normalize(c.config.root_dir)
     if root and contains(root, path) then
       -- Deepest wins: with a nested pair of roots the tighter one is the better-scoped project.
       if not best or #root > #best_root then
@@ -216,6 +219,12 @@ end
 --- `workspace.workspaceEdit.snippetEditSupport` is the other one. The server checks it before
 --- converting a live template (`ModStartTemplate`) and, without it, drops every fix whose template
 --- is mandatory. snippet_edit.lua is what honours the promise.
+---
+--- `experimental.licensingUi` says this client shows the license itself. The server then pushes
+--- `jetbrains/licensing/state` after every change (licensing.lua keeps it) and stops sending its own
+--- `window/showMessage` warnings on grace, parking and license-server ticket loss. The sign-in flow
+--- also needs `window.showDocument`, which Neovim's defaults already advertise: the server opens the
+--- JetBrains Account page through it, and signin.lua answers it.
 function M.capabilities()
   local caps = vim.lsp.protocol.make_client_capabilities()
   caps.window = caps.window or {}
@@ -223,6 +232,8 @@ function M.capabilities()
   caps.workspace = caps.workspace or {}
   caps.workspace.workspaceEdit = caps.workspace.workspaceEdit or {}
   caps.workspace.workspaceEdit.snippetEditSupport = true
+  caps.experimental = caps.experimental or {}
+  caps.experimental.licensingUi = true
   return caps
 end
 
@@ -761,9 +772,17 @@ end
 --- Full `vim.lsp.start` configuration.
 --- @param root_dir string
 --- @param cfg table
+--- @param consent IntellijLspConsent|nil what `consent.ensure` settled; left out, the config's own
+---   `accept_eula`, `region` and `data_sharing` are used as they stand
 --- @return table
-function M.config(root_dir, cfg)
-  local handlers = progress.handlers()
+function M.config(root_dir, cfg, consent)
+  consent = consent or {
+    eula_accepted = cfg.accept_eula == true,
+    region = cfg.region,
+    data_sharing = cfg.data_sharing,
+  }
+  local handlers = vim.tbl_extend('error', progress.handlers(), licensing.handlers(),
+    require('intellij-lsp.signin').handlers())
   local commands = {}
 
   -- Only registered alongside the `intellijExtensions` init option: the flag promises the server
@@ -812,10 +831,10 @@ function M.config(root_dir, cfg)
     cmd = launch.build_cmd({
       server_path = cfg.server_path,
       root_dir = root_dir,
-      accept_eula = cfg.accept_eula,
+      accept_eula = consent.eula_accepted,
       system_path = system_path,
     }),
-    cmd_env = launch.build_env(cfg.jvm_args),
+    cmd_env = launch.build_env(cfg.jvm_args, consent),
     root_dir = root_dir,
     -- Not a `vim.lsp.start` field: kept on the config so `:checkhealth` and the init watchdog can
     -- find this instance's server log.
@@ -847,6 +866,12 @@ function M.config(root_dir, cfg)
       -- codicon markup, which Neovim renders literally. Stripped in the response rather than at
       -- display time, because `vim.lsp.codelens` owns the rendering and offers no hook into it.
       M.install_response_fixes(client)
+      -- A parked (unlicensed) server refuses every feature request; keep that out of the editor.
+      licensing.install_quiet(client)
+      -- ...and say so on the first line, since an editor that stays quiet looks broken.
+      if cfg.license_hint ~= false then licensing.install_hints() end
+      -- What the server's license is, and what to do when it has none.
+      licensing.startup(client)
     end,
 
     on_attach = function(client, bufnr)
@@ -925,20 +950,32 @@ function M.config(root_dir, cfg)
     on_exit = function(code, _, client_id)
       progress.reset(client_id)
       versions.reset(client_id)
+      licensing.reset(client_id)
       -- Required inside the callback, not at the top of the file: a session that runs with
       -- `progress = false` should not pay to load the module.
       require('intellij-lsp.status').reset(client_id)
       -- The server has let go of its index lock, so another instance may take this directory.
       launch.release_system_path(system_path)
       claimed[system_path] = nil
-      -- Exit code 7: the server's licensing check failed, so an expired build exits instead of
-      -- starting.
+      -- Exit code 7: the server's licensing check refused this build at startup. An unlicensed
+      -- server does not exit; it starts and refuses requests instead.
       if code == 7 then
         vim.schedule(function()
           vim.notify(
-            'IntelliJ LSP: the server build has expired. Build or download a newer bundle.',
+            'IntelliJ LSP: the server refused to start this build (license check failed, exit code 7).',
             vim.log.levels.ERROR
           )
+        end)
+      -- 11: the EULA was not accepted. 12: the bundle's EULA.txt is missing or modified. Both are
+      -- checked before the server reads a byte of the protocol, so every root's server exits alike;
+      -- `consent.lua` asks once for all of them.
+      elseif code == 11 then
+        vim.schedule(function()
+          require('intellij-lsp.consent').eula_rejected(cfg, require('intellij-lsp').restart)
+        end)
+      elseif code == 12 then
+        vim.schedule(function()
+          require('intellij-lsp.consent').bundle_corrupted(cfg.server_path, require('intellij-lsp').reinstall)
         end)
       end
     end,

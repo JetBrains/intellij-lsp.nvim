@@ -108,6 +108,7 @@ end
 
 --- Command line for the server.
 --- @param opts table {server_path, root_dir, accept_eula, system_path?}
+--- `accept_eula` is whether the user accepted this bundle's EULA, by config or on the consent screen.
 --- `system_path` is the claimed cache directory; left out, the root's plain slot is used.
 --- @return string[]
 function M.build_cmd(opts)
@@ -134,12 +135,12 @@ local function shell_quote_if_needed(arg)
   return '"' .. arg:gsub('(["\\$`])', '\\%1') .. '"'
 end
 
---- Variables that must not reach the server process.
+--- Variables that must not be inherited by the server process.
 ---
 --- `IJ_LAUNCHER_DEBUG` makes the launcher write its debug log to stdout, which *is* the LSP channel
---- under `--stdio`; inheriting it corrupts the protocol stream. The other two are not configured by
---- this plugin, and the server rejects any value it does not recognise, so an inherited value would
---- fail the launch outright.
+--- under `--stdio`; inheriting it corrupts the protocol stream. The other two carry the user's
+--- consent, which comes from `consent.lua` and nowhere else: an inherited value would bypass what the
+--- user answered, and one the server does not recognise fails the launch outright.
 local CLEARED = { 'IJ_LAUNCHER_DEBUG', 'INTELLIJ_DATA_SHARING', 'INTELLIJ_REGION' }
 
 --- Complete environment for the server process.
@@ -147,9 +148,12 @@ local CLEARED = { 'IJ_LAUNCHER_DEBUG', 'INTELLIJ_DATA_SHARING', 'INTELLIJ_REGION
 --- Returns the *full* environment rather than a sparse overlay: `vim.system` has no way to express
 --- "remove this variable" (a `false` value is stringified to "false", which the server then rejects
 --- as an invalid data-sharing level), so unwanted variables must be absent from the table entirely.
+---
+--- `data_sharing = 'none'` sets nothing: it is the server's default, and VS Code leaves it out too.
 --- @param jvm_args string[]|nil extra JVM options
+--- @param consent { region: string|nil, data_sharing: string|nil }|nil
 --- @return table<string, string>
-function M.build_env(jvm_args)
+function M.build_env(jvm_args, consent)
   local env = {}
   for key, value in pairs(vim.fn.environ()) do
     env[key] = value
@@ -157,6 +161,12 @@ function M.build_env(jvm_args)
 
   for _, key in ipairs(CLEARED) do
     env[key] = nil
+  end
+
+  consent = consent or {}
+  if consent.region then env.INTELLIJ_REGION = consent.region end
+  if consent.data_sharing and consent.data_sharing ~= 'none' then
+    env.INTELLIJ_DATA_SHARING = consent.data_sharing
   end
 
   -- JVM options reach the launcher through the environment, not argv.

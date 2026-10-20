@@ -52,7 +52,9 @@ local function check(name, cond, detail)
   else failures = failures + 1; print('FAIL ' .. name .. (detail and ('  -> ' .. tostring(detail)) or '')) end
 end
 
-require('intellij-lsp').setup({ server_path = SERVER, accept_eula = true, build_tool = 'maven' })
+require('intellij-lsp').setup({
+  server_path = SERVER, accept_eula = true, region = 'europe', data_sharing = 'none', build_tool = 'maven',
+})
 
 vim.cmd('edit ' .. GREETER)
 vim.cmd('edit ' .. MAIN)

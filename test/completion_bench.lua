@@ -48,6 +48,8 @@ end
 require('intellij-lsp').setup({
   server_path = vim.env.IJLS_SERVER,
   accept_eula = true,
+  region = 'europe',
+  data_sharing = 'none',
   build_tool = vim.env.BUILD_TOOL,
   completion_delay = tonumber(vim.env.COMPLETION_DELAY or '100'),
 })

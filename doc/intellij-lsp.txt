@@ -5,13 +5,14 @@ CONTENTS                                                *intellij-lsp-contents*
 
     1. Introduction ......................... |intellij-lsp-introduction|
     2. Setup ................................. |intellij-lsp-setup|
-    3. Options ............................... |intellij-lsp-options|
-    4. Commands ............................... |intellij-lsp-commands|
-    5. Navigation and editing ................. |intellij-lsp-navigation|
-    6. Running and debugging .................. |intellij-lsp-run-debug|
-    7. Git .................................... |intellij-lsp-git|
-    8. Health check ........................... |intellij-lsp-health|
-    9. Troubleshooting ......................... |intellij-lsp-troubleshooting|
+    3. Licensing ............................. |intellij-lsp-licensing|
+    4. Options ............................... |intellij-lsp-options|
+    5. Commands ............................... |intellij-lsp-commands|
+    6. Navigation and editing ................. |intellij-lsp-navigation|
+    7. Running and debugging .................. |intellij-lsp-run-debug|
+    8. Git .................................... |intellij-lsp-git|
+    9. Health check ........................... |intellij-lsp-health|
+   10. Troubleshooting ........................ |intellij-lsp-troubleshooting|
 
 ==============================================================================
 1. Introduction                                     *intellij-lsp-introduction*
@@ -48,7 +49,313 @@ Or point the plugin at a server bundle you already have: >lua
 Then run `:checkhealth intellij-lsp`.
 
 ==============================================================================
-3. Options                                              *intellij-lsp-options*
+3. Licensing                                         *intellij-lsp-licensing*
+
+The `intellij-server` bundle is a JetBrains product with its own license.
+Every build starts with a 30-day trial and then needs a subscription. The
+plugin asks for consent before the first server starts; the server does
+everything else (sign-in, trial, license store, grace period) and the
+plugin shows what it reports and passes on what you choose.
+
+    1. First start: region, EULA and data sharing, asked once, or set in
+       `setup()` (|intellij-lsp-consent|).
+    2. A server without a license offers to activate one, once per session
+       (|intellij-lsp-license-startup|): sign in with a JetBrains Account,
+       start the 30-day trial, enter an activation code, or use a license
+       server (|intellij-lsp-activation|). Over SSH, the sign-in takes a
+       code pasted into a terminal (|intellij-lsp-sign-in|).
+    3. `:IntellijLspLicense` shows, changes and removes the license
+       (|intellij-lsp-license-command|).
+    4. A license that is lost, enters its grace period, or is about to end
+       is announced once, and a statusline function shows what needs
+       attention (|intellij-lsp-license-status|).
+
+Every licensing screen (setup, activation, status, confirmations, input,
+sign-in) opens as a float of the same width in the middle of the editor,
+titled "Java and Kotlin by IntelliJ IDEA · ...". It takes focus but blocks
+nothing.
+
+Without a license the server still starts, but answers no Java or Kotlin
+request. `:checkhealth intellij-lsp` reports each server's license and the
+consent it was launched with (|intellij-lsp-health|).
+
+The license store belongs to the OS user, not the project: every project's
+server, and every other client of the server (VS Code, the `intellij-server`
+CLI), share it. It is `~/Library/Application Support/JetBrains/IntelliJServer`
+on macOS, `~/.config/JetBrains/IntelliJServer` on Linux, and
+`%APPDATA%\JetBrains\IntelliJServer` on Windows. The plugin never writes to
+it; the server does.
+
+First start                                         *intellij-lsp-consent*
+
+Before the first server starts, a setup screen opens in the middle of the
+editor, titled "Java and Kotlin by IntelliJ IDEA · Setup 1/3". It welcomes
+you and asks three questions, in this order: your region (Europe first),
+the bundle's license agreement (`EULA.txt`, scrollable: `a` accepts, `q`
+declines), and whether to send usage statistics (detailed, anonymous, or
+none; see
+https://www.jetbrains.com/legal/docs/terms/product_data_collection/).
+Region and data sharing take a digit, or <CR> on an entry; `q` or <Esc>
+cancels. Only the questions without an answer are asked. The screen takes
+focus but blocks nothing: it waits until you are in normal mode, and
+closing it counts as cancelling.
+
+The answers are stored in `stdpath('data') .. '/intellij-lsp/consent.json'`
+and asked only once. A new bundle whose `EULA.txt` changed asks for the
+EULA again. An EULA already accepted by another client of the same server
+(VS Code, the `intellij-server` CLI) is not asked again.
+
+Declining or closing a screen starts no server for the rest of the session.
+`:IntellijLspLicense setup` asks again.
+
+To never see the screens (dotfiles, CI, scripts), set all three: >lua
+
+    require('intellij-lsp').setup({
+      accept_eula = true,      -- after reading EULA.txt in the bundle
+      region = 'europe',
+      data_sharing = 'none',
+    })
+<
+Neovim without a UI (`--headless`) cannot ask. There `accept_eula = true`
+is required; a missing `region` or `data_sharing` starts the server with
+its defaults (no region, no usage statistics) and says so once.
+
+License check at startup                        *intellij-lsp-license-startup*
+
+Every server that starts, including after `:IntellijLspRestart`, asks for
+its license state. A server without any license first looks for one on its
+own: a license server in `JETBRAINS_LICENSE_SERVER`, a JetBrains Toolbox
+login, a product key file. "Checking license…" shows only if that takes
+more than half a second.
+
+Still without a valid license, the plugin opens the activation float
+(|intellij-lsp-activation|) once per Neovim session, not once per project.
+It waits until you are back in normal mode, so keys typed in insert mode
+are not taken as a choice. Without a UI (`--headless`) it warns instead
+and names the commands that activate a license: >sh
+
+    <bundle>/bin/intellij-server license trial
+    <bundle>/bin/intellij-server license login
+<
+A running server picks the new license up within seconds, no restart.
+
+A license from the environment (|intellij-lsp-license-env|) takes
+precedence: the float then says so and offers only the license server.
+
+Activating a license                              *intellij-lsp-activation*
+
+Without a license, `:IntellijLspLicense` opens the activation float (with
+one, the status float, |intellij-lsp-license-command|, whose entry 1 opens
+it). Press a digit (or <CR> on an entry); `q` or <Esc> is "Later":
+
+    1  Start 30-day trial               the anonymous trial. Not offered
+                                        when a license is already active.
+    2  Sign in with JetBrains Account   opens the sign-in page in your
+                                        browser and activates a license
+                                        from the account. With several
+                                        subscriptions, you pick one.
+    3  Enter activation code            a float to paste the code into;
+                                        line breaks and spaces are
+                                        dropped. <C-s> (or <CR> in normal
+                                        mode) activates, `q` cancels. A
+                                        rejected code is offered again.
+    4  Use a license server             asks for its URL (http:// or
+                                        https://).
+
+Entries that are not offered are hidden and the rest numbered from 1.
+
+The sign-in waits up to five minutes for the browser. Starting another
+activation meanwhile cancels it. A trial, an activation code or a license
+server that takes over from a JetBrains Account signs the account out.
+The outcome is reported once: the license now active, or what went wrong.
+
+Signing in                                           *intellij-lsp-sign-in*
+
+When the server opens a sign-in page (a JetBrains Account, or a license
+server that asks for one), the plugin opens it with |vim.ui.open()|, copies
+its link to the `+` register when a clipboard provider exists, and shows
+the link in a float with a spinner until the sign-in ends. In the float,
+`y` copies the link again, `o` opens it again, and <Esc>, `q` or closing
+the float cancels a JetBrains Account sign-in.
+
+The browser sign-in ends in a redirect to the server's machine. From an SSH
+session (`$SSH_CONNECTION` or `$SSH_TTY` set), or on Linux without
+`$DISPLAY` and `$WAYLAND_DISPLAY`, the browser runs elsewhere and the
+redirect cannot come back. There, the sign-in entry of the activation float reads
+"Sign in with JetBrains Account (paste a code)" and runs
+`intellij-server license login --code` in a terminal split: open the link
+it prints (it is also copied, and over SSH Neovim's OSC 52 clipboard carries
+it to your terminal), sign in, and paste the code the page shows into the
+terminal. The running servers pick the license up within about a second,
+no restart. The split closes on success and stays open with the reason on
+failure. `:IntellijLspLicense login --code` does the same anywhere, for when
+the browser's redirect fails.
+
+The license command                          *intellij-lsp-license-command*
+
+`:IntellijLspLicense` with a license active opens the status float: the
+source, product, holder, license ID, valid-through date and days left, the
+signed-in JetBrains Account, and any problem. Its entries:
+
+    1  Change license                   the activation float, without the
+                                        trial (|intellij-lsp-activation|)
+    2  Remove license                   asks, then removes it (see `remove`)
+    3  Sign out of JetBrains Account    asks, then signs out (see `logout`)
+    4  Refresh subscriptions            fetches the account's subscriptions
+
+Entries that do not apply are hidden and the rest numbered from 1.
+
+The subcommands do one thing each and complete with <Tab>:
+
+    status              the status float, also without a license
+    login [--code]      sign in with a JetBrains Account
+                        (|intellij-lsp-sign-in|)
+    logout              sign out of the JetBrains Account. JetBrains IDEs
+                        on this machine share the sign-in and are signed
+                        out too; a license from the account goes with it
+    trial               start the 30-day trial
+    activate [code]     activate with a code; without one, a float asks
+                        for it. Spaces and line breaks are dropped
+    server [url]        use a license server; without a URL, it asks
+    use                 pick one of the account's valid subscriptions
+    refresh             fetch the account's subscriptions again, e.g.
+                        after buying one
+    remove              remove the active license: a subscription is
+                        released and the account signed out; a trial, an
+                        activation code or a product key file is
+                        disabled; a license server is removed. EAP and
+                        JetBrains Toolbox licenses cannot be removed here.
+                        Java and Kotlin features stop until another
+                        license is active
+    setup               ask region, EULA and data sharing again
+                        (|intellij-lsp-consent|)
+    reset [--account]   stop the servers, remove this machine's license,
+                        and forget the EULA acceptance and the stored
+                        consent answers; `--account` also signs out of the
+                        JetBrains Account. `:IntellijLspRestart` starts
+                        again and asks the consent questions. The EULA
+                        acceptance is shared with other clients of the
+                        server (VS Code, the CLI), which ask again too
+
+The commands act on the current buffer's server, or any running one: every
+server reads the same license store. With no server running, `status`,
+`trial`, `activate` and `login` run the server's own CLI
+(`<bundle>/bin/intellij-server license ...`) on that store instead, and
+the servers started later find the license there. `status` then shows the
+store without entries. `reset` always runs the CLI, after stopping the
+servers.
+
+With a license from the environment (|intellij-lsp-license-env|), `remove`
+is refused: the variable would license the next start again.
+
+Environment variables                              *intellij-lsp-license-env*
+
+These, set in Neovim's environment, reach the server and give it its
+license. Each overrides anything activated from Neovim:
+
+    `INTELLIJ_SERVER_LICENSE`        a license key
+    `INTELLIJ_SERVER_LICENSE_FILE`   the path of a license key file
+    `JETBRAINS_LICENSE_SERVER`       a license server URL; also found by
+                                     the discovery at startup
+
+While one is set, the activation float offers only the license server, the
+status float has no "Remove license" and says why, and
+`:IntellijLspLicense remove` is refused. Unset the variable and run
+`:IntellijLspRestart` to activate a license from Neovim.
+
+`INTELLIJ_REGION` and `INTELLIJ_DATA_SHARING` are never inherited: the
+plugin sets them from the consent answers (|intellij-lsp-region|,
+|intellij-lsp-data_sharing|).
+
+To keep the license store somewhere else, pass the server a directory: >lua
+
+    require('intellij-lsp').setup({
+      jvm_args = { '-Dintellij.server.license.dir=/path/to/dir' },
+    })
+<
+
+License notices and statusline                *intellij-lsp-license-status*
+
+The plugin tells you once when the license changes for the worse, whichever
+server root reports it:
+
+    - the grace period started: features keep working until the time shown,
+    - features stopped: the grace period ended, or the license was revoked
+      or removed outside Neovim (a removal through `:IntellijLspLicense`
+      reports its own outcome),
+    - the JetBrains Account session expired: sign in again
+      (`:IntellijLspLicense login`) to keep the license,
+    - the license server could not renew the license, or the license from
+      it was lost,
+    - the trial ends soon: at 7 days left and at 1 day left, at most once a
+      day and once per trial across sessions (recorded in
+      `stdpath('data')/intellij-lsp/license-notices.json`).
+
+A server that starts without a license gets the activation float instead
+(|intellij-lsp-license-startup|).
+
+While the server refuses features, what Neovim asks for on its own reads
+as empty: no completion, highlights, hints or diagnostics, and no error per
+keystroke. A note at the end of each buffer's first line says why
+(|intellij-lsp-license_hint|). What you ask for never passes for "done" or
+"nothing found":
+
+    - References, go to definition, declaration, type definition and
+      implementation, and hover open the activation float, which names
+      what you asked for. Neovim would otherwise report "No references
+      found", since it drops the errors of these requests.
+    - Code actions (`gra`) offer a single action, "Activate a license to
+      use code actions", which opens the float.
+    - Everything else (formatting, rename, symbol search, commands such as
+      `:IntellijLspReload`) fails with a message saying there is no
+      license.
+
+Once a license is active, diagnostics, semantic tokens, code lenses and
+inlay hints come back without reopening the buffer, and the note goes
+away.
+
+                                                      *intellij-lsp.license()*
+require('intellij-lsp').license([{bufnr}])
+    Statusline text for the license of {bufnr}'s server (default: the
+    current buffer), or of any running server. Empty while nothing needs
+    attention; otherwise one of:
+
+        `IJ trial 5d`     a trial with 7 or fewer days left
+        `IJ license 3d`   another license with 7 or fewer days left
+        `IJ grace 12m`    the grace period, minutes (or `3h`, hours) left
+        `IJ sign in`      the JetBrains Account session expired
+        `IJ signing in`   a sign-in is under way
+        `IJ unlicensed`   features are off
+>lua
+    vim.o.statusline = "%f %m%=%{v:lua.require'intellij-lsp'.license()} %l:%c"
+<
+    The statusline redraws on its own as you move; to show a change at once,
+    redraw on the `User IntellijLspLicense` event: >lua
+    vim.api.nvim_create_autocmd('User', {
+      pattern = 'IntellijLspLicense',
+      command = 'redrawstatus',
+    })
+<
+License state                                  *intellij-lsp-license-event*
+
+The server reports its license to the plugin whenever it changes. Each
+change fires a `User IntellijLspLicense` autocmd, for statuslines and
+scripts. `ev.data.client_id` is the server's client, `ev.data.view` what to
+show (nil once that server exits): `kind` is one of `licensed`,
+`session-expired`, `grace`, `parked`, `authenticating` or `unlicensed`;
+`message` is a one-line description; `source`, `days_left`,
+`valid_through`, `grace_deadline` and `parked_reason` fill in the details: >lua
+    vim.api.nvim_create_autocmd('User', {
+      pattern = 'IntellijLspLicense',
+      callback = function(ev)
+        local view = ev.data.view
+        if view and view.kind ~= 'licensed' then print(view.message) end
+      end,
+    })
+<
+
+==============================================================================
+4. Options                                              *intellij-lsp-options*
 
 Pass these to `require('intellij-lsp').setup({...})`.
 
@@ -62,8 +369,30 @@ server_download                                 *intellij-lsp-server_download*
     `false` makes `server_path` required. Default: true.
 
 accept_eula
-    Accept the bundle's `EULA.txt`. Required for released bundles; dev
-    builds carry no EULA. Default: false.
+    Accept the bundle's `EULA.txt` without the consent screen. Dev builds
+    carry no EULA. Default: unset, which asks on first start
+    (|intellij-lsp-consent|).
+
+region                                                 *intellij-lsp-region*
+    Your region, for product terms and data processing: "africa",
+    "americas", "apac" (Asia except Mainland China), "china" (Mainland
+    China), "europe", "middle_east" or "oceania". Passed to the server as
+    `INTELLIJ_REGION`. Default: unset, which asks on first start.
+
+data_sharing                                     *intellij-lsp-data_sharing*
+    Usage statistics and error reports: "full" (detailed), "anonymous"
+    (messages and user data stripped) or "none". Passed to the server as
+    `INTELLIJ_DATA_SHARING`; "none" is the server's default and passes
+    nothing. Default: unset, which asks on first start.
+
+    An invalid `region` or `data_sharing` is reported by `setup()` and
+    asked on the consent screen instead. Values inherited from the
+    environment never reach the server.
+
+license_hint                                     *intellij-lsp-license_hint*
+    While the server has no license, the first line of each of its buffers
+    ends in `No license, IntelliJ features are off · :IntellijLspLicense`,
+    in `DiagnosticVirtualTextWarn`. Default: true.
 
 build_tool
     Force an importer: "maven", "gradle", "bazel", "jps". Unset
@@ -188,9 +517,25 @@ debug
     and nvim-dap. Default: true.
 
 ==============================================================================
-4. Commands                                            *intellij-lsp-commands*
+5. Commands                                            *intellij-lsp-commands*
 
 :IntellijLspRestart            Restart the server.
+:IntellijLspLicense            Show the license (status float), or
+                                activate one when there is none
+                                (|intellij-lsp-activation|).
+:IntellijLspLicense {subcommand}
+                                `status`, `login [--code]`, `logout`,
+                                `trial`, `activate [code]`, `server [url]`,
+                                `use`, `refresh`, `remove`, `setup`,
+                                `reset [--account]`
+                                (|intellij-lsp-license-command|).
+                                `login --code` signs in by pasting a code
+                                into the CLI in a terminal
+                                (|intellij-lsp-sign-in|). `setup` asks
+                                region, EULA and data sharing again (only
+                                those not set in `setup()`); region and
+                                data sharing apply on restart, which is
+                                offered; with no server running, it starts.
 :IntellijLspClearCache         Stop the server, delete the index, restart.
                                 The cache directory is per project; a second
                                 Neovim on the same project gets a `-2` suffixed
@@ -237,7 +582,7 @@ debug
 :IntellijLspDebugWatch [expr]     Watch an expression across stops.
 
 ==============================================================================
-5. Navigation and editing                            *intellij-lsp-navigation*
+6. Navigation and editing                            *intellij-lsp-navigation*
 
 Neovim's built-in LSP mappings (`gd`, `K`, `gra`, `grn`, `grr`, `]d`, ...)
 all work. On top of them, in a Java or Kotlin buffer:
@@ -270,7 +615,7 @@ Compiler errors: diagnostics are IntelliJ's inspections. For what the
 compiler itself would say, run `:IntellijLspCompilationErrors`.
 
 ==============================================================================
-6. Running and debugging                              *intellij-lsp-run-debug*
+7. Running and debugging                              *intellij-lsp-run-debug*
 
 Put the cursor inside a class with a `main` method and press <leader>rr to
 run it, or <leader>rd to debug it. Running and debugging need
@@ -296,7 +641,7 @@ See the README's "Running", "Debugging" and "Build output" sections for
 the full panel keymaps and behaviour.
 
 ==============================================================================
-7. Git                                                       *intellij-lsp-git*
+8. Git                                                       *intellij-lsp-git*
 
 Read-only: a change list, a diff view, the commit log, and branch
 switching. Drives the `git` CLI directly, so it works in any filetype and
@@ -306,30 +651,76 @@ See the README's "Git" section for the full command reference and panel
 keymaps.
 
 ==============================================================================
-8. Health check                                           *intellij-lsp-health*
+9. Health check                                           *intellij-lsp-health*
 
 Run `:checkhealth intellij-lsp` to check:
 
     - whether a downloaded server bundle is cached
     - whether the server binary exists and is executable
     - the bundled JBR and server version
-    - EULA acceptance, when the bundle requires it
+    - the consent answers and where each comes from (`setup()`, the
+      consent screen, or the server's own record of the EULA), and whether
+      a consent screen was declined in this session
     - the project root and detected build system
-    - running servers, including a probe for an unlicensed (parked) server
+    - running servers, each with its license as the server reports it:
+      source, status, valid-through date and days left, and why features
+      are off when they are (`parkedReason`), plus a license from the
+      environment and the region and data sharing it was launched with
     - the server's own verdict on the last import, folder by folder, and
       any folder it could not import (two build systems side by side,
       no build file, ...)
 
 ==============================================================================
-9. Troubleshooting                                 *intellij-lsp-troubleshooting*
+10. Troubleshooting                              *intellij-lsp-troubleshooting*
 
 The server exits immediately~
-    Most likely an expired build (exit code 7). EAP bundles expire; build
-    or fetch a fresh one.
+    Most likely a failed license check (exit code 7): the server refused to
+    start this build. Download a newer bundle. A build that is merely
+    unlicensed does not exit, see below.
+
+No server starts, "the server was not started"~
+    A consent screen was declined or closed, or Neovim has no UI to show
+    the EULA. Run `:IntellijLspLicense setup`, or set `accept_eula`,
+    `region` and `data_sharing` (|intellij-lsp-consent|).
+
+The server exits with code 11 or 12~
+    11: the server did not accept the EULA; the plugin forgets the stored
+    acceptance and shows the EULA again. 12: the bundle's `EULA.txt` is
+    missing or modified, so the bundle is damaged; a downloaded bundle is
+    offered for deletion and a fresh download, your own bundle needs
+    reinstalling.
 
 Everything is silent, no results, no errors~
     An unlicensed server starts normally and then rejects every
-    non-licensing request. `:checkhealth intellij-lsp` detects this.
+    non-licensing request, which the plugin keeps quiet while you type
+    (|intellij-lsp-license-status|). It opens the activation float once per
+    session (|intellij-lsp-license-startup|) and says so once when a license
+    is lost; `:IntellijLspLicense` opens the float again,
+    `require('intellij-lsp').license()` shows `IJ unlicensed` in a
+    statusline, and `:checkhealth intellij-lsp` names the reason.
+
+The trial ended~
+    After the 30-day trial the server needs a subscription. Sign in with a
+    JetBrains Account that holds one (`:IntellijLspLicense login`), or use
+    an activation code or a license server (|intellij-lsp-activation|).
+    Starting the trial again hands back the same, ended trial.
+
+A license activated in Neovim has no effect~
+    `INTELLIJ_SERVER_LICENSE`, `INTELLIJ_SERVER_LICENSE_FILE` or
+    `JETBRAINS_LICENSE_SERVER` is set and overrides it; `:checkhealth
+    intellij-lsp` names the variable. Unset it and run `:IntellijLspRestart`
+    (|intellij-lsp-license-env|).
+
+The JetBrains Account sign-in never finishes~
+    Over SSH, or anywhere the browser cannot reach the server's machine,
+    the redirect after signing in goes nowhere. Cancel with <Esc> and run
+    `:IntellijLspLicense login --code` (|intellij-lsp-sign-in|).
+
+The wrong license is active, or licensing is stuck~
+    `:IntellijLspLicense status` shows what the server holds; its entry 1
+    activates another license, `:IntellijLspLicense remove` drops it. To
+    start over from the consent questions, `:IntellijLspLicense reset`,
+    then `:IntellijLspRestart` (|intellij-lsp-license-command|).
 
 Nothing gets imported~
     If a root contains more than one build system, the server asks which

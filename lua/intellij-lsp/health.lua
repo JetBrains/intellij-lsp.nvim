@@ -1,8 +1,8 @@
 --- `:checkhealth intellij-lsp`
 ---
---- Focuses on the failure modes that are otherwise silent: an expired build, a parked (unlicensed)
---- server that answers every request with ServerCancelled, and a root whose build system could not
---- be resolved.
+--- Focuses on the failure modes that are otherwise silent: a refused build, missing consent, a
+--- parked (unlicensed) server whose refusals the plugin turns into empty results, and a root whose
+--- build system could not be resolved.
 
 local M = {}
 
@@ -66,22 +66,49 @@ local function check_runtime(cfg)
   end
 end
 
+--- Where the consent answers come from. Unanswered ones are not a problem: the next server start
+--- asks on the consent screen (|intellij-lsp-consent|), so they are only reported.
 local function check_eula(cfg)
-  local eula = require('intellij-lsp.eula')
+  local consent = require('intellij-lsp.consent')
   local root = require('intellij-lsp.launch').server_root(cfg.server_path)
-  local hash = eula.hash_for(root)
+  local c = consent.resolve(cfg, root)
 
-  if not hash then
+  local from = {
+    config = 'from setup()',
+    store = 'on the consent screen (' .. consent.store_path() .. ')',
+    server = "in the server's record (" .. consent.license_dir(cfg.jvm_args) .. ')',
+  }
+  -- `:checkhealth` from a script has no UI either. There a missing EULA acceptance keeps the server
+  -- from starting, while region and data sharing fall back to the server's defaults. `info` takes no
+  -- advice, so the hint goes into the line.
+  local ui = consent._has_ui()
+  local ask = ui and 'The next server start asks, or set %s in setup().'
+    or "Neovim without a UI cannot ask and starts with the server's default: set %s in setup() to choose."
+  if not c.eula_hash then
     vim.health.ok('no EULA.txt in the bundle (dev build; enforcement is skipped)')
-    return
+  elseif c.eula_accepted then
+    vim.health.ok(('EULA accepted %s, hash %s'):format(from[c.sources.eula], c.eula_hash))
+  else
+    local read = ' Read ' .. root .. '/EULA.txt first.'
+    if ui then
+      vim.health.info('EULA not accepted yet. ' .. ask:format('accept_eula = true') .. read)
+    else
+      vim.health.warn('EULA not accepted yet. Neovim without a UI cannot ask and does not start: '
+        .. 'set accept_eula = true in setup().' .. read)
+    end
   end
 
-  if cfg.accept_eula then
-    vim.health.ok('EULA accepted, hash ' .. hash)
-  else
-    vim.health.error('bundle requires EULA acceptance but accept_eula is false', {
-      'The server will exit at startup without --eula.',
-      'Read ' .. root .. '/EULA.txt, then set accept_eula = true.',
+  for _, key in ipairs({ 'region', 'data_sharing' }) do
+    if c[key] then
+      vim.health.ok(('%s = %s (%s)'):format(key, c[key], from[c.sources[key]]))
+    else
+      vim.health.info(key .. ' not set yet. ' .. ask:format(key))
+    end
+  end
+
+  if consent.declined() then
+    vim.health.warn('a consent screen was declined in this session; no server starts', {
+      'Run :IntellijLspLicense setup to answer the questions again.',
     })
   end
 end
@@ -148,6 +175,79 @@ local function check_root_and_build_system()
   end
 end
 
+--- The server's license as `:checkhealth` lines, most important first. Pure.
+---
+--- A parked server answers every feature request with ServerCancelled, which the plugin turns into
+--- empty results (|intellij-lsp-license-status|): silence in the editor, so this is where the reason
+--- shows. The consent values are the ones the server was launched with, read from its environment;
+--- answers changed since then apply on restart.
+--- @param view IntellijLspLicenseView|false|nil the projected state; false when the server does not
+---   speak the licensing protocol, nil when its state could not be read
+--- @param env table<string, string>|nil the server's environment (`client.config.cmd_env`)
+--- @return { level: 'ok'|'info'|'warn'|'error', text: string, advice: string[]|nil }[]
+function M._license_report(view, env)
+  local licensing = require('intellij-lsp.licensing')
+  local days = licensing.days_left_text
+  local out = {}
+  local function add(level, text, advice) out[#out + 1] = { level = level, text = '  ' .. text, advice = advice } end
+
+  if view == false then
+    add('info', 'the server does not report its license (a bundle without the licensing protocol)')
+  elseif view == nil then
+    add('warn', 'could not read the license state', { 'Run :IntellijLspLicense status.' })
+  else
+    local details = {}
+    if view.source_label then details[#details + 1] = 'source ' .. view.source_label end
+    if view.status then details[#details + 1] = 'status ' .. view.status end
+    if view.valid_through then
+      details[#details + 1] = 'valid through ' .. view.valid_through
+        .. (view.days_left and (' (' .. days(view.days_left) .. ')') or '')
+    elseif view.days_left then
+      details[#details + 1] = days(view.days_left)
+    end
+    if view.parked_reason then details[#details + 1] = 'parked: ' .. view.parked_reason end
+    local text = 'license: ' .. view.message .. (#details > 0 and (' [' .. table.concat(details, ', ') .. ']') or '')
+
+    if view.kind == 'licensed' then
+      add('ok', text)
+    elseif view.kind == 'authenticating' then
+      add('info', text)
+    elseif view.kind == 'parked' then
+      add('error', text, {
+        'The server refuses Java and Kotlin features; the editor stays silent instead of erroring.',
+        'Run :IntellijLspLicense to activate a license.',
+      })
+    elseif view.kind == 'session-expired' then
+      add('warn', text, { 'Run :IntellijLspLicense login.' })
+    else
+      add('warn', text, { 'Run :IntellijLspLicense.' })
+    end
+    if view.error then add('warn', view.error) end
+  end
+
+  local env_var = licensing.environment_license(env)
+  if env_var then add('info', 'license set through ' .. env_var .. ', which overrides the license store') end
+  if env then
+    add('info', ('launched with region %s, data sharing %s'):format(
+      env.INTELLIJ_REGION or 'unset', env.INTELLIJ_DATA_SHARING or 'none'))
+  end
+  return out
+end
+
+--- The server's current licensing state, asked for with `state/get` (the store may lag a moment
+--- behind a change), else the last one it pushed.
+--- @param c vim.lsp.Client
+--- @return IntellijLspLicenseView|false|nil see `M._license_report`
+local function license_view(c)
+  local licensing = require('intellij-lsp.licensing')
+  if not licensing.supported(c) then return false end
+  local ok, reply = pcall(c.request_sync, c, 'jetbrains/licensing/state/get', vim.empty_dict(), 3000)
+  if ok and reply and not reply.err and type(reply.result) == 'table' then
+    return licensing.project(reply.result)
+  end
+  return licensing.view(c.id)
+end
+
 local function check_running_clients()
   local client = require('intellij-lsp.client')
   local progress = require('intellij-lsp.progress')
@@ -160,6 +260,10 @@ local function check_running_clients()
 
   for _, c in ipairs(clients) do
     vim.health.ok(('server running (id %d, root %s)'):format(c.id, c.config.root_dir or '?'))
+
+    for _, item in ipairs(M._license_report(license_view(c), c.config.cmd_env)) do
+      vim.health[item.level](item.text, item.advice)
+    end
 
     if progress.is_ready(c.id) then
       vim.health.ok('  indexing complete')
@@ -205,17 +309,6 @@ local function check_running_clients()
     end
     if c.config.index_dir then
       vim.health.info('  index dir: ' .. c.config.index_dir)
-    end
-
-    -- A parked (unlicensed) server answers every non-licensing request with ServerCancelled, which
-    -- most clients swallow silently. Probe one cheap request to surface that state.
-    local ok, err = pcall(function()
-      return c:request_sync('workspace/symbol', { query = 'A' }, 3000)
-    end)
-    if ok and err and err.err then
-      vim.health.warn('  server rejected a probe request: ' .. vim.inspect(err.err), {
-        'ServerCancelled on every request means the build is unlicensed or expired.',
-      })
     end
   end
 end

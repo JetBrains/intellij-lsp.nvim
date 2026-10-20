@@ -73,6 +73,8 @@ local function note(s) table.insert(notes, s) print('     .. ' .. s) end
 require('intellij-lsp').setup({
   server_path = SERVER,
   accept_eula = true,
+  region = 'europe',
+  data_sharing = 'none',
   build_tool = 'maven',
 })
 

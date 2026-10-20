@@ -7,6 +7,7 @@
 ---   })
 
 local client = require('intellij-lsp.client')
+local consent = require('intellij-lsp.consent')
 local progress = require('intellij-lsp.progress')
 
 local M = {}
@@ -17,7 +18,15 @@ local M = {}
 --- @field server_download boolean|nil
 ---                                 download the bundle for this platform when server_path is
 ---                                 unset (default true); false makes server_path required
---- @field accept_eula boolean|nil  accept the bundle's EULA (required for released bundles)
+--- @field accept_eula boolean|nil  accept the bundle's EULA.txt; unset asks on first start
+--- @field region string|nil        "africa"|"americas"|"apac"|"china"|"europe"|"middle_east"|
+---                                 "oceania", for product terms and data processing; unset asks
+---                                 on first start
+--- @field data_sharing string|nil  usage statistics and error reports: "full"|"anonymous"|"none";
+---                                 unset asks on first start. With all three set no consent
+---                                 screen ever shows
+--- @field license_hint boolean|nil while the server has no license, a note at the end of the
+---                                 first line of its buffers says so (default true)
 --- @field build_tool string|nil    force an importer: "maven"|"gradle"|"bazel"|"jps"; "" skips import
 --- @field default_sdk string|nil   JDK home used to analyze code (not to run the server)
 --- @field projects table[]|nil     explicitly configured projects
@@ -149,7 +158,21 @@ local function start_for_buffer(bufnr)
   if not root_dir then return end
 
   vim.b[bufnr].intellij_lsp_attached = true
-  vim.lsp.start(client.config(root_dir, M.config), { bufnr = bufnr })
+  -- Synchronous once consent is settled. While its screens are open, other buffers queue up here.
+  consent.ensure(M.config, function(settled)
+    if not vim.api.nvim_buf_is_valid(bufnr) then return end
+    if not settled then
+      vim.b[bufnr].intellij_lsp_attached = nil
+      return
+    end
+    -- An earlier launch in the same queue (the eager one, a sibling module) may cover this file now.
+    local covering = name ~= '' and client.find_ancestor_client(name) or nil
+    if covering then
+      vim.lsp.buf_attach_client(bufnr, covering.id)
+      return
+    end
+    vim.lsp.start(client.config(root_dir, M.config, settled), { bufnr = bufnr })
+  end)
 end
 
 --- Starts the server from a build file in the working directory, with no source file open.
@@ -213,7 +236,13 @@ local function start_eagerly()
   if not root_dir then return end
 
   vim.g.intellij_lsp_eager_started = true
-  vim.lsp.start(client.config(root_dir, M.config), { attach = false })
+  consent.ensure(M.config, function(settled)
+    if not settled then
+      vim.g.intellij_lsp_eager_started = nil
+      return
+    end
+    vim.lsp.start(client.config(root_dir, M.config, settled), { attach = false })
+  end)
 end
 
 --- Stops every server started by this plugin.
@@ -302,6 +331,107 @@ function M.clear_cache()
   end, 500)
 end
 
+--- Deletes a corrupted downloaded bundle, downloads it again and starts the servers on it.
+---
+--- The servers are stopped first because they run from the directory being deleted. The version
+--- directory is the bundle root itself: `server_download` extracts each version into its own.
+function M.reinstall()
+  stop_all()
+  clear_attach_flags()
+  local root = require('intellij-lsp.launch').server_root(M.config.server_path)
+  vim.defer_fn(function()
+    vim.fn.delete(root, 'rf')
+    require('intellij-lsp.server_download').ensure(function(path, err)
+      if not path then
+        vim.notify('IntelliJ LSP: could not download the server: ' .. err, vim.log.levels.ERROR)
+        return
+      end
+      M.config.server_path = path
+      attach_loaded_buffers()
+    end)
+  end, 500)
+end
+
+--- `:IntellijLspLicense setup`: asks region, EULA and data sharing again.
+---
+--- Region and data sharing are launch parameters, so a running server keeps the old values until
+--- it restarts; that is offered rather than done, since a restart re-imports the project. With no
+--- server running -- the screens were declined earlier -- the servers simply start.
+local function license_setup()
+  consent.setup_again(M.config, function(before, after)
+    if #vim.lsp.get_clients({ name = client.NAME }) == 0 then
+      attach_loaded_buffers()
+      return
+    end
+    if not consent.launch_differs(before, after) then return end
+    vim.ui.select({ 'Restart now', 'Later' }, {
+      prompt = 'The new answers take effect when the server restarts:',
+    }, function(_, idx)
+      if idx == 1 then M.restart() end
+    end)
+  end)
+end
+
+--- Subcommands, each called with the arguments after its name and the context they act in, and what
+--- each one completes. license.lua has all but `setup`, which restarts the launches this module owns.
+--- @return table<string, { run: fun(fargs: string[], ctx: table), args: string[] }>
+local function license_subcommands()
+  local subs = vim.tbl_extend('force', {}, require('intellij-lsp.license').SUBCOMMANDS)
+  subs.setup = { run = license_setup, args = {} }
+  return subs
+end
+
+--- @param args table `nvim_create_user_command` arguments
+local function license_command(args)
+  local license = require('intellij-lsp.license')
+  if args.fargs[1] == nil then return license.open(M.config) end
+  local subs = license_subcommands()
+  local sub = subs[args.fargs[1]]
+  if not sub then
+    local names = vim.tbl_keys(subs)
+    table.sort(names)
+    vim.notify('IntelliJ LSP: usage: :IntellijLspLicense [' .. table.concat(names, '|') .. ']', vim.log.levels.WARN)
+    return
+  end
+  sub.run(vim.list_slice(args.fargs, 2), { config = M.config, stop_all = stop_all })
+end
+
+--- Completion for `:IntellijLspLicense`: subcommand names, then that subcommand's arguments.
+--- @param lead string
+--- @param line string
+--- @return string[]
+function M._complete_license(lead, line)
+  local words = vim.split(vim.trim(line:sub(1, #line - #lead)), '%s+')
+  local candidates
+  local subs = license_subcommands()
+  if #words <= 1 then
+    candidates = vim.tbl_keys(subs)
+  else
+    local sub = subs[words[2]]
+    candidates = (sub and #words == 2) and sub.args or {}
+  end
+  table.sort(candidates)
+  return vim.tbl_filter(function(name) return vim.startswith(name, lead) end, candidates)
+end
+
+--- The license for a statusline: `''` while nothing needs attention, otherwise a short tag such as
+--- `IJ trial 5d`, `IJ grace 12m` or `IJ unlicensed` (`licensing.statusline`).
+---
+--- Reads the server of `bufnr` (default: the current buffer), else any running one: every server
+--- reads the same license store. Cheap enough to call on every redraw.
+--- @param bufnr integer|nil
+--- @return string
+function M.license(bufnr)
+  local licensing = require('intellij-lsp.licensing')
+  local clients = vim.lsp.get_clients({ name = client.NAME, bufnr = bufnr or 0 })
+  if #clients == 0 then clients = vim.lsp.get_clients({ name = client.NAME }) end
+  for _, c in ipairs(clients) do
+    local view = licensing.view(c.id)
+    if view then return licensing.statusline(view) end
+  end
+  return ''
+end
+
 --- Re-applies configuration without a restart.
 ---
 --- The server re-reads `initializationOptions` from the request payload rather than reusing the ones
@@ -320,8 +450,15 @@ function M.reload()
     c:request('intellij/reloadWorkspace', {
       initializationOptions = client.init_options(root, M.config),
     }, function(err)
-      if err then
-        -- ServerCancelled is what a parked (unlicensed) server answers; :checkhealth explains it.
+      local licensing = require('intellij-lsp.licensing')
+      if err and err.code == licensing.SERVER_CANCELLED and licensing.declined(c.id) then
+        -- What a parked (unlicensed) server answers.
+        local view = licensing.view(c.id)
+        vim.notify(
+          'IntelliJ LSP: reload refused: ' .. (view and view.message or 'no active license.') .. ' Run :IntellijLspLicense.',
+          vim.log.levels.WARN
+        )
+      elseif err then
         vim.notify(
           'IntelliJ LSP: reload failed: ' .. tostring(err.message or err),
           vim.log.levels.ERROR
@@ -469,6 +606,11 @@ local function finish_setup()
   vim.api.nvim_create_user_command('IntellijLspReload', M.reload, {
     desc = 'Re-apply configuration on the running IntelliJ language server',
   })
+  vim.api.nvim_create_user_command('IntellijLspLicense', license_command, {
+    nargs = '*',
+    complete = M._complete_license,
+    desc = 'IntelliJ licensing: show, activate, change or remove the license (see :help intellij-lsp-license-command)',
+  })
   -- Hierarchies, formatting and symbol search: global commands over per-buffer features, so they
   -- exist whether or not a buffer is attached yet.
   require('intellij-lsp.editor').register_commands()
@@ -538,7 +680,7 @@ end
 function M.setup(opts)
   opts = opts or {}
   M.config = vim.tbl_extend('force', {
-    accept_eula = false,
+    license_hint = true,
     server_download = true,
     projects = {},
     disable_rocksdb_wal = false,
@@ -567,6 +709,17 @@ function M.setup(opts)
   }, opts)
   M.config.server_path = expand(M.config.server_path)
   M.config.default_sdk = expand(M.config.default_sdk)
+
+  -- A value the server does not know would fail every launch. Dropped instead, so the consent screen
+  -- asks for it, and reported once per setup() call.
+  local problems = consent.validate(M.config)
+  if #problems > 0 then
+    vim.notify('IntelliJ LSP: ignoring invalid options:\n  ' .. table.concat(problems, '\n  '),
+      vim.log.levels.ERROR)
+    for _, key in ipairs({ 'region', 'data_sharing', 'accept_eula' }) do
+      if #consent.validate({ [key] = M.config[key] }) > 0 then M.config[key] = nil end
+    end
+  end
 
   -- Applied before the server_path check so that a misconfigured server still leaves you with the
   -- colours you asked for. On by default, but yields to a scheme already in effect: setup() usually

@@ -130,6 +130,312 @@ check('jvm args -> IJ_JAVA_OPTIONS', env.IJ_JAVA_OPTIONS and env.IJ_JAVA_OPTIONS
 check('jvm arg with space quoted', env.IJ_JAVA_OPTIONS:find('"-Dfoo=a b"', 1, true) ~= nil, env.IJ_JAVA_OPTIONS)
 check('no jvm args -> unset', launch.build_env(nil).IJ_JAVA_OPTIONS == nil)
 
+-- Consent reaches the server only through build_env, replacing whatever was inherited.
+local cenv = launch.build_env(nil, { region = 'apac', data_sharing = 'anonymous' })
+check('consent region -> INTELLIJ_REGION', cenv.INTELLIJ_REGION == 'apac', tostring(cenv.INTELLIJ_REGION))
+check('consent data sharing -> INTELLIJ_DATA_SHARING', cenv.INTELLIJ_DATA_SHARING == 'anonymous', tostring(cenv.INTELLIJ_DATA_SHARING))
+check('consent full -> INTELLIJ_DATA_SHARING=full', launch.build_env(nil, { data_sharing = 'full' }).INTELLIJ_DATA_SHARING == 'full')
+local none_env = launch.build_env(nil, { region = 'europe', data_sharing = 'none' })
+check("data_sharing 'none' leaves the variable out", none_env.INTELLIJ_DATA_SHARING == nil, tostring(none_env.INTELLIJ_DATA_SHARING))
+check('no region -> inherited INTELLIJ_REGION still cleared', launch.build_env(nil, { data_sharing = 'full' }).INTELLIJ_REGION == nil)
+vim.env.IJ_LAUNCHER_DEBUG, vim.env.INTELLIJ_DATA_SHARING, vim.env.INTELLIJ_REGION = nil, nil, nil
+
+do -- scoped: Lua allows 200 locals per chunk
+-- ---------------------------------------------------------------------------
+-- Consent: region, EULA and data sharing before the server starts
+-- ---------------------------------------------------------------------------
+local consent = require('intellij-lsp.consent')
+local real_store_path, real_has_ui = consent.store_path, consent._has_ui
+local store_file = vim.fn.tempname() .. '-consent/consent.json'
+consent.store_path = function() return store_file end
+
+check('valid consent options pass', #consent.validate({ accept_eula = true, region = 'europe', data_sharing = 'none' }) == 0)
+check('unset consent options pass', #consent.validate({}) == 0)
+local bad = consent.validate({ region = 'mars', data_sharing = 'some', accept_eula = 'yes' })
+check('three bad consent options -> three problems', #bad == 3, vim.inspect(bad))
+check('the problem names the bad value', bad[1]:find('"mars"', 1, true) ~= nil, bad[1])
+check('regions: Europe first', consent.REGIONS[1] == 'europe')
+check('every region has a label', #vim.tbl_filter(function(r) return consent.REGION_LABELS[r] == nil end, consent.REGIONS) == 0)
+
+-- Store
+check('no store file -> empty store', vim.tbl_isempty(consent.read_store()))
+consent.update_store({ region = 'china' })
+consent.update_store({ data_sharing = 'full', eula_hash = 'abc' })
+local stored = consent.read_store()
+check('store merges answers', stored.region == 'china' and stored.data_sharing == 'full' and stored.eula_hash == 'abc', vim.inspect(stored))
+consent.update_store({ eula_hash = false })
+check('false removes a stored answer', consent.read_store().eula_hash == nil and consent.read_store().region == 'china')
+vim.fn.writefile({ '{"region":"mars","data_sharing":"none"}' }, store_file)
+check('an invalid stored value is dropped', consent.read_store().region == nil and consent.read_store().data_sharing == 'none', vim.inspect(consent.read_store()))
+vim.fn.writefile({ 'not json' }, store_file)
+check('an unparsable store reads as empty', vim.tbl_isempty(consent.read_store()))
+vim.fn.delete(store_file)
+
+-- The server's license dir and its EULA record
+check('license dir from jvm_args', consent.license_dir({ '-Xmx1g', '-Dintellij.server.license.dir=/tmp/lic' }) == '/tmp/lic',
+  consent.license_dir({ '-Dintellij.server.license.dir=/tmp/lic' }))
+vim.env.IJ_JAVA_OPTIONS = '-Dintellij.server.license.dir=/tmp/inherited -Xss2m'
+check('license dir from IJ_JAVA_OPTIONS', consent.license_dir(nil) == '/tmp/inherited', consent.license_dir(nil))
+check('jvm_args win over IJ_JAVA_OPTIONS', consent.license_dir({ '-Dintellij.server.license.dir=/tmp/mine' }) == '/tmp/mine')
+vim.env.IJ_JAVA_OPTIONS = nil
+check('default license dir is JetBrains/IntelliJServer', vim.endswith(consent.license_dir(nil), '/JetBrains/IntelliJServer'), consent.license_dir(nil))
+
+local lic_dir = vim.fn.tempname() .. '-lic'
+vim.fn.mkdir(lic_dir, 'p')
+vim.fn.writefile({ '1111111111111111', '2222222222222222' }, lic_dir .. '/eula-accepted.hashes')
+check('server record: listed hash accepted', consent.server_accepted(lic_dir, '2222222222222222'))
+check('server record: other hash not accepted', not consent.server_accepted(lic_dir, '3333333333333333'))
+check('server record: no file -> not accepted', not consent.server_accepted(lic_dir .. '-none', '1111111111111111'))
+
+-- resolve: config, then store, then the server's record
+local cbundle = vim.fn.tempname() .. '-cbundle'
+vim.fn.mkdir(cbundle .. '/bin', 'p')
+vim.fn.writefile({ 'EULA text', 'second line' }, cbundle .. '/EULA.txt')
+local chash = eula.hash_for(cbundle)
+local empty_lic = { '-Dintellij.server.license.dir=' .. lic_dir .. '-none' }
+
+local r = consent.resolve({ jvm_args = empty_lic }, cbundle, {})
+check('nothing answered -> asks region, eula, data sharing in order',
+  vim.deep_equal(r.missing, { 'region', 'eula', 'data_sharing' }), vim.inspect(r.missing))
+check('unanswered EULA is not accepted', r.eula_accepted == false and r.eula_hash == chash)
+
+r = consent.resolve({ accept_eula = true, region = 'europe', data_sharing = 'none' }, cbundle, { region = 'china' })
+check('fully configured -> nothing to ask', #r.missing == 0, vim.inspect(r.missing))
+check('config wins over the store', r.region == 'europe' and r.sources.region == 'config', vim.inspect(r))
+
+r = consent.resolve({ jvm_args = empty_lic }, cbundle, { eula_hash = chash, region = 'oceania', data_sharing = 'full' })
+check('stored answers -> nothing to ask', #r.missing == 0 and r.sources.eula == 'store' and r.region == 'oceania', vim.inspect(r))
+
+r = consent.resolve({ jvm_args = empty_lic }, cbundle, { eula_hash = 'stalestalestale0', region = 'oceania', data_sharing = 'full' })
+check('a changed EULA is asked again', vim.deep_equal(r.missing, { 'eula' }), vim.inspect(r.missing))
+
+vim.fn.writefile({ chash }, lic_dir .. '/eula-accepted.hashes')
+r = consent.resolve({ jvm_args = { '-Dintellij.server.license.dir=' .. lic_dir } }, cbundle, {})
+check("the server's record accepts the EULA", r.eula_accepted and r.sources.eula == 'server', vim.inspect(r.sources))
+
+r = consent.resolve({ region = 'europe', data_sharing = 'none' }, BUNDLE, {})
+check('dev bundle: no EULA to ask', #r.missing == 0 and r.sources.eula == 'bundle' and r.eula_hash == nil, vim.inspect(r))
+
+-- client.config launches with what consent settled
+local ccfg = client.config('/tmp/ijconsent', { server_path = cbundle .. '/bin/intellij-server' },
+  { eula_accepted = true, region = 'americas', data_sharing = 'anonymous' })
+check('settled EULA -> --eula <hash>', vim.tbl_contains(ccfg.cmd, '--eula') and vim.tbl_contains(ccfg.cmd, chash), table.concat(ccfg.cmd, ' '))
+check('settled region in cmd_env', ccfg.cmd_env.INTELLIJ_REGION == 'americas')
+check('settled data sharing in cmd_env', ccfg.cmd_env.INTELLIJ_DATA_SHARING == 'anonymous')
+local unsettled = client.config('/tmp/ijconsent', { server_path = cbundle .. '/bin/intellij-server' },
+  { eula_accepted = false })
+check('unaccepted EULA -> no --eula', not vim.tbl_contains(unsettled.cmd, '--eula'))
+check('external showDocument goes to signin.lua',
+  ccfg.handlers['window/showDocument'] == require('intellij-lsp.signin').show_document)
+launch.release_system_path(ccfg.system_path)
+
+-- ensure: one pending consent, shared by every launch
+local select_mod = require('intellij-lsp.select')
+local real_select, real_open_eula, real_ui_select = select_mod.select, consent._open_eula, vim.ui.select
+local real_choose = consent._choose
+local prompts, eula_opened, eula_answer = {}, 0, true
+consent._choose = function(step, _, _, done)
+  table.insert(prompts, step)
+  -- Region: Europe (row 1). Data sharing: anonymous (row 2).
+  vim.schedule(function() done(step == 'region' and 'europe' or 'anonymous') end)
+end
+consent._open_eula = function(_, done) eula_opened = eula_opened + 1; vim.schedule(function() done(eula_answer) end) end
+consent._has_ui = function() return true end
+
+local ecfg = { server_path = cbundle .. '/bin/intellij-server', jvm_args = empty_lic }
+consent._reset()
+vim.fn.delete(store_file)
+local results, sync_result = {}, nil
+for i = 1, 3 do consent.ensure(ecfg, function(c) results[i] = c or false end) end
+check('incomplete consent answers nobody synchronously', vim.tbl_isempty(results))
+vim.wait(1000, function() return #results == 3 end, 10)
+check('three launches -> each screen shown once', #prompts == 2 and eula_opened == 1, vim.inspect(prompts) .. ' eula=' .. eula_opened)
+check('screens in order: region, EULA, data sharing', prompts[1] == 'region' and prompts[2] == 'data_sharing', vim.inspect(prompts))
+check('every waiting launch gets the consent', #results == 3 and results[3] and results[3].region == 'europe'
+  and results[3].data_sharing == 'anonymous' and results[3].eula_accepted, vim.inspect(results[3]))
+check('answers are stored', vim.deep_equal(consent.read_store(), { eula_hash = chash, region = 'europe', data_sharing = 'anonymous' }), vim.inspect(consent.read_store()))
+consent.ensure(ecfg, function(c) sync_result = c end)
+check('answered consent -> synchronous, no screens', sync_result and #prompts == 2 and eula_opened == 1)
+
+-- Declining the EULA starts nothing, and no later launch asks again this session.
+consent._reset()
+vim.fn.delete(store_file)
+prompts, eula_opened, eula_answer = {}, 0, false
+local declined_results = {}
+local real_notify, notified = vim.notify, {}
+vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
+for i = 1, 2 do consent.ensure(ecfg, function(c) declined_results[i] = c or false end) end
+vim.wait(1000, function() return #declined_results == 2 end, 10)
+check('declined EULA -> every launch refused', declined_results[1] == false and declined_results[2] == false, vim.inspect(declined_results))
+check('declined EULA -> data sharing never asked', #prompts == 1, vim.inspect(prompts))
+check('declining notifies once, with the way back', #notified == 1 and notified[1].msg:find(':IntellijLspLicense setup', 1, true), vim.inspect(notified))
+check('the region answer before the decline is kept', consent.read_store().region == 'europe' and consent.read_store().eula_hash == nil)
+local after_decline = 'unset'
+consent.ensure(ecfg, function(c) after_decline = c end)
+check('after a decline: refused at once, no screen', after_decline == nil and eula_opened == 1)
+check('after a decline: declined() tells :checkhealth', consent.declined() == true)
+
+-- No UI: nothing can be asked. Without the EULA accepted the launch is refused; with it, region and
+-- data sharing fall back to the server's defaults, as before these questions existed.
+consent._reset()
+consent._has_ui = function() return false end
+notified = {}
+local headless_result = 'unset'
+consent.ensure(ecfg, function(c) headless_result = c end)
+vim.wait(1000, function() return headless_result ~= 'unset' end, 10)
+check('headless, EULA not accepted: refused', headless_result == nil)
+check('headless, EULA not accepted: says to set accept_eula', notified[1]
+  and notified[1].msg:find('set accept_eula = true', 1, true), vim.inspect(notified))
+consent._reset()
+vim.fn.delete(store_file)
+notified = {}
+headless_result = 'unset'
+local hcfg = vim.tbl_extend('force', ecfg, { accept_eula = true })
+consent.ensure(hcfg, function(c) headless_result = c end)
+vim.wait(1000, function() return headless_result ~= 'unset' end, 10)
+check('headless, only accept_eula: starts on the server defaults', type(headless_result) == 'table'
+  and headless_result.region == nil and headless_result.data_sharing == nil and #headless_result.missing == 0,
+  vim.inspect(headless_result))
+check('headless defaults: one warning naming the options', #notified == 1 and notified[1].level == vim.log.levels.WARN
+  and notified[1].msg:find('region and data_sharing', 1, true), vim.inspect(notified))
+local again = 'unset'
+consent.ensure(hcfg, function(c) again = c end)
+check('headless defaults: later launches start at once, without another warning',
+  type(again) == 'table' and #notified == 1, vim.inspect(again))
+check('headless defaults: the environment carries neither variable', (function()
+  local env = launch.build_env(nil, headless_result)
+  return env.INTELLIJ_REGION == nil and env.INTELLIJ_DATA_SHARING == nil
+end)())
+consent._reset()
+consent._has_ui = function() return true end
+
+-- :IntellijLspLicense setup asks again, except what the config fixes.
+consent._reset()
+consent.update_store({ eula_hash = chash, region = 'china', data_sharing = 'full' })
+prompts, eula_opened, eula_answer = {}, 0, true
+local changed
+consent.setup_again(vim.tbl_extend('force', ecfg, { region = 'europe' }), function(before, after) changed = { before, after } end)
+vim.wait(1000, function() return changed ~= nil end, 10)
+check('setup again: region from config is not asked', #prompts == 1 and prompts[1] ~= 'region', vim.inspect(prompts))
+check('setup again: stored EULA is asked again', eula_opened == 1)
+check('setup again: reports before and after', changed and changed[1].data_sharing == 'full' and changed[2].data_sharing == 'anonymous', vim.inspect(changed))
+check('a data-sharing change differs at launch', changed and consent.launch_differs(changed[1], changed[2]))
+check('identical consent does not differ', not consent.launch_differs({ region = 'europe', data_sharing = 'none', eula_accepted = true }, { region = 'europe', data_sharing = 'none', eula_accepted = true }))
+
+notified = {}
+consent.setup_again({ server_path = ecfg.server_path, accept_eula = true, region = 'europe', data_sharing = 'none' }, function() error('nothing to ask') end)
+check('setup again with everything configured says so', notified[1] and notified[1].msg:find('setup%(%) config'), vim.inspect(notified))
+
+-- Exit code 11: forget the stored EULA, ask again, relaunch once accepted.
+consent._reset()
+consent.update_store({ eula_hash = chash, region = 'europe', data_sharing = 'none' })
+prompts, eula_opened, eula_answer = {}, 0, true
+local relaunched = 0
+consent.eula_rejected(ecfg, function() relaunched = relaunched + 1 end)
+consent.eula_rejected(ecfg, function() relaunched = relaunched + 1 end)
+vim.wait(1000, function() return relaunched > 0 end, 10)
+check('exit 11: EULA asked again once', eula_opened == 1 and #prompts == 0, 'eula=' .. eula_opened .. ' ' .. vim.inspect(prompts))
+check('exit 11: relaunched once', relaunched == 1, relaunched)
+-- The server record named the hash too, but the server refused it: it is no longer trusted.
+vim.fn.writefile({ chash }, lic_dir .. '/eula-accepted.hashes')
+consent.update_store({ eula_hash = false })
+r = consent.resolve({ jvm_args = { '-Dintellij.server.license.dir=' .. lic_dir } }, cbundle, {})
+check('exit 11: server record distrusted afterwards', not r.eula_accepted, vim.inspect(r.sources))
+
+consent._reset()
+notified, relaunched = {}, 0
+consent.eula_rejected(vim.tbl_extend('force', ecfg, { accept_eula = true }), function() relaunched = relaunched + 1 end)
+check('exit 11 with accept_eula = true: error, no loop', relaunched == 0 and notified[1] and notified[1].level == vim.log.levels.ERROR, vim.inspect(notified))
+
+-- Exit code 12: a downloaded bundle is offered for re-download; a user's own bundle is not.
+notified = {}
+local reinstalled, offered = 0, nil
+local orig_choose12 = require('intellij-lsp.activation').choose
+require('intellij-lsp.activation').choose = function(opts, on_choice) offered = opts.items; on_choice(opts.items[1], 1) end
+consent.bundle_corrupted(cbundle .. '/bin/intellij-server', function() reinstalled = reinstalled + 1 end)
+check("exit 12, user's bundle: error, no re-download", reinstalled == 0 and offered == nil and notified[1] and notified[1].msg:find('exit code 12'), vim.inspect(notified))
+local cached = require('intellij-lsp.server_download').cache_root() .. '/263.0/bin/intellij-server'
+consent.bundle_corrupted(cached, function() reinstalled = reinstalled + 1 end)
+check('exit 12, downloaded bundle: re-download offered and run', offered and reinstalled == 1, vim.inspect(offered))
+require('intellij-lsp.activation').choose = orig_choose12
+
+-- The real EULA float: scrollable, read-only, `a` accepts, closing declines.
+consent._open_eula = real_open_eula
+local accepted
+local ewin = consent._open_eula('first line\nsecond line', function(a) accepted = a end, { index = 2, total = 3 })
+local ebuf = vim.api.nvim_win_get_buf(ewin)
+check('EULA opens in a focused float', vim.api.nvim_win_get_config(ewin).relative == 'editor' and vim.api.nvim_get_current_win() == ewin)
+check('EULA text shown read-only', vim.api.nvim_buf_get_lines(ebuf, 0, -1, false)[2] == 'second line' and not vim.bo[ebuf].modifiable)
+check('EULA title names the product and the step',
+  vim.api.nvim_win_get_config(ewin).title[1][1] == ' Java and Kotlin by IntelliJ IDEA · Setup 2/3: license agreement ',
+  vim.inspect(vim.api.nvim_win_get_config(ewin).title))
+vim.api.nvim_feedkeys('a', 'x', false)
+vim.wait(500, function() return accepted ~= nil end, 10)
+check('`a` accepts and closes', accepted == true and not vim.api.nvim_win_is_valid(ewin))
+accepted = nil
+ewin = consent._open_eula('text', function(a) accepted = a end, { index = 1, total = 2 })
+local elines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(ewin), 0, -1, false)
+check('EULA as the first screen opens with the welcome', elines[1] == ' Welcome to Java and Kotlin by IntelliJ IDEA!'
+  and elines[2]:find('answer 2 questions', 1, true) and elines[#elines] == 'text', vim.inspect(elines))
+vim.api.nvim_win_close(ewin, true)
+vim.wait(500, function() return accepted ~= nil end, 10)
+check('closing the EULA declines', accepted == false)
+
+-- The real question screens: centred, named, numbered; a digit answers, `q` cancels.
+consent._choose = real_choose
+local chosen = 'unset'
+consent._choose('region', 1, 3, function(v) chosen = v end)
+local cwin = vim.api.nvim_get_current_win()
+local ccfg_win = vim.api.nvim_win_get_config(cwin)
+local clines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(cwin), 0, -1, false)
+check('question: a focused float titled with the product and step', ccfg_win.relative == 'editor'
+  and ccfg_win.title[1][1] == ' Java and Kotlin by IntelliJ IDEA · Setup 1/3 ', vim.inspect(ccfg_win.title))
+check('question: centred, not in a corner', ccfg_win.col > 0 and ccfg_win.row > 0
+  and math.abs((vim.o.columns - ccfg_win.width) / 2 - ccfg_win.col) <= 1, vim.inspect({ ccfg_win.row, ccfg_win.col, ccfg_win.width }))
+check('question 1 opens with the welcome, then the question and Europe first',
+  clines[1] == ' Welcome to Java and Kotlin by IntelliJ IDEA!' and clines[2]:find('answer 3 questions', 1, true)
+  and vim.tbl_contains(clines, ' 1  Europe'), vim.inspect(clines))
+vim.api.nvim_feedkeys('3', 'x', false)
+vim.wait(500, function() return chosen ~= 'unset' end, 10)
+check('question: a digit answers and closes', chosen == 'americas' and not vim.api.nvim_win_is_valid(cwin), tostring(chosen))
+chosen = 'unset'
+consent._choose('data_sharing', 3, 3, function(v) chosen = v end)
+cwin = vim.api.nvim_get_current_win()
+clines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(cwin), 0, -1, false)
+check('a later question has no welcome, names the data notice', clines[1]:find('Help JetBrains', 1, true)
+  and table.concat(clines, ' '):find(consent.DATA_SHARING_URL, 1, true), vim.inspect(clines))
+vim.api.nvim_feedkeys('q', 'x', false)
+vim.wait(500, function() return chosen ~= 'unset' end, 10)
+check('question: `q` cancels', chosen == nil and not vim.api.nvim_win_is_valid(cwin), tostring(chosen))
+-- A license float already open does not swallow the question: it closes (choosing nothing) and the
+-- question opens, so the launches waiting on it are answered.
+local activation_mod = require('intellij-lsp.activation')
+local license_choice = 'unset'
+local lwin = activation_mod.menu({ title = 'license', footer = 'q', lines = { ' 1  x' }, first = 1,
+  actions = { { key = '1', name = 'x', label = 'x' } } }, function(name) license_choice = name end)
+chosen = 'unset'
+consent._choose('region', 1, 1, function(v) chosen = v end)
+cwin = vim.api.nvim_get_current_win()
+check('question: replaces an open license float', not vim.api.nvim_win_is_valid(lwin) and cwin ~= lwin
+  and vim.api.nvim_win_get_config(cwin).title[1][1]:find('Setup 1/1', 1, true) ~= nil)
+vim.wait(500, function() return license_choice ~= 'unset' end, 10)
+check('question: the replaced float chose nothing', license_choice == nil, tostring(license_choice))
+vim.api.nvim_feedkeys('1', 'x', false)
+vim.wait(500, function() return chosen ~= 'unset' end, 10)
+check('question: and is answered', chosen == 'europe', tostring(chosen))
+local plain = activation_mod.menu({ title = 'a', footer = 'q', lines = { ' 1  x' }, first = 1,
+  actions = { { key = '1', name = 'x', label = 'x' } } }, function() end)
+check('menu: without replace, a second call focuses the open float', activation_mod.menu({ title = 'b', footer = 'q',
+  lines = { ' 1  y' }, first = 1, actions = { { key = '1', name = 'y', label = 'y' } } }, function() end) == plain)
+vim.api.nvim_win_close(plain, true)
+
+vim.notify, vim.ui.select = real_notify, real_ui_select
+select_mod.select, consent._has_ui = real_select, real_has_ui
+consent.store_path = real_store_path
+consent._reset()
+vim.fn.delete(cbundle, 'rf'); vim.fn.delete(lic_dir, 'rf'); vim.fn.delete(vim.fs.dirname(store_file), 'rf')
+end
+
 -- the load-bearing capability
 local caps = client.capabilities()
 check('window.workDoneProgress = true', caps.window.workDoneProgress == true)
@@ -848,6 +1154,46 @@ do
   vim.api.nvim_buf_set_name(orphan, 'jrt:/java.base/java/lang/Orphan.class')
   start_for_buffer(orphan)
   check('a library buffer never starts a server of its own', started == 0, started)
+
+  -- A source buffer launches through the consent gate: synchronously once it is settled, and not at
+  -- all when it cannot be asked, with the attach guard cleared so a later setup can attach it.
+  local init = require('intellij-lsp')
+  local consent = require('intellij-lsp.consent')
+  local saved_cfg, saved_store, saved_ui = init.config, consent.store_path, consent._has_ui
+  local store = vim.fn.tempname() .. '-gate.json'
+  consent.store_path = function() return store end
+  consent._reset()
+  local launched
+  vim.lsp.start = function(cfg) started = started + 1; launched = cfg end
+  vim.fn.writefile({ 'class Main {}' }, proj .. '/Main.java')
+  local src = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(src, proj .. '/Main.java')
+
+  init.config = { server_path = SERVER, region = 'europe', data_sharing = 'full' }
+  start_for_buffer(src)
+  check('settled consent: the buffer launches at once', started == 1 and launched.cmd_env.INTELLIJ_REGION == 'europe'
+    and launched.cmd_env.INTELLIJ_DATA_SHARING == 'full', started)
+  launch.release_system_path(launched.system_path)
+
+  -- Headless with a bundle whose EULA nobody accepted: the one answer without a default.
+  vim.b[src].intellij_lsp_attached = nil
+  local eula_bundle = vim.fn.tempname() .. '-eula-bundle'
+  vim.fn.mkdir(eula_bundle .. '/bin', 'p')
+  vim.fn.writefile({ 'terms' }, eula_bundle .. '/EULA.txt')
+  init.config = { server_path = eula_bundle .. '/bin/intellij-server',
+    jvm_args = { '-Dintellij.server.license.dir=' .. eula_bundle .. '/license' } }
+  consent._has_ui = function() return false end
+  local real_notify = vim.notify
+  vim.notify = function() end
+  start_for_buffer(src)
+  vim.wait(500, function() return vim.b[src].intellij_lsp_attached == nil end, 10)
+  vim.notify = real_notify
+  check('unanswerable consent: nothing launches', started == 1, started)
+  check('unanswerable consent: the attach guard is cleared', vim.b[src].intellij_lsp_attached == nil)
+  vim.fn.delete(eula_bundle, 'rf')
+
+  init.config, consent.store_path, consent._has_ui = saved_cfg, saved_store, saved_ui
+  consent._reset()
 
   vim.cmd('cd ' .. vim.fn.fnameescape(old_cwd))
   vim.lsp.start, vim.lsp.buf_attach_client, vim.lsp.get_client_by_id = real_start, real_attach, real_by_id
@@ -2044,6 +2390,1758 @@ check('frame label drops line 0', dbg._frame_label({ name = '53 hidden frames', 
 check('frame label appends a missing line', dbg._frame_label({ name = 'main', line = 7 }) == 'main:7', dbg._frame_label({ name = 'main', line = 7 }))
 check('value-less variable shows only its type', dbg._format_value({ value = ' ', type = 'Owner@1' }) == '(Owner@1)', dbg._format_value({ value = ' ', type = 'Owner@1' }))
 check('value and type', dbg._format_value({ value = '1', type = 'int' }) == '1  (int)', dbg._format_value({ value = '1', type = 'int' }))
+
+-- ---------------------------------------------------------------------------
+-- Licensing protocol: capability, state store, requests, projection
+-- ---------------------------------------------------------------------------
+-- A function of its own: the main chunk is at Lua's limit of 200 locals.
+;(function()
+local licensing = require('intellij-lsp.licensing')
+
+-- The capability that turns on the state pushes, and the one the sign-in page relies on.
+check('experimental.licensingUi = true', caps.experimental and caps.experimental.licensingUi == true, vim.inspect(caps.experimental))
+check('window.showDocument.support = true', vim.tbl_get(caps, 'window', 'showDocument', 'support') == true,
+  vim.inspect(caps.window.showDocument))
+check('client config handles the state push',
+  type(client.config('/tmp/ijtest', {}).handlers[licensing.STATE]) == 'function')
+
+-- Captured from 263.7084.0 (`license status --json`, 2026-10-20): this machine's trial, and an empty
+-- license dir.
+local CAPTURED_TRIAL = vim.json.decode([[{"activeLicense": {"source": "trial", "status": "Valid", "product": "intellij-server", "daysLeft": 27, "validThrough": "2026-11-17"}, "jbaLicensingState": {"authenticationStatus": "NotAuthenticated"}, "licenseServerFlowState": {"kind": "notConfigured"}, "featuresDeclined": false}]])
+local CAPTURED_PARKED = vim.json.decode([[{"jbaLicensingState": {"authenticationStatus": "NotAuthenticated"}, "licenseServerFlowState": {"kind": "notConfigured"}, "featuresDeclined": true, "parkedReason": "StartedUnlicensed"}]])
+
+-- Shaped after the server's licensing state, for the states a fresh store cannot reach.
+local function lstate(t)
+  return vim.tbl_extend('force', {
+    jbaLicensingState = { authenticationStatus = 'NotAuthenticated' },
+    licenseServerFlowState = { kind = 'notConfigured' },
+    featuresDeclined = false,
+  }, t)
+end
+local SUB = { kind = 'Subscription', licensedTo = 'Ada Lovelace', product = 'intellij-server', validThrough = '2027-01-31',
+  licenseId = 'LIC123', assetId = 'asset-1', status = 'Valid' }
+local DEADLINE = 1792000000000
+
+local v = licensing.project(CAPTURED_TRIAL)
+check('trial: licensed', v.kind == 'licensed', vim.inspect(v))
+check('trial: display fields', v.source == 'trial' and v.source_label == 'Trial' and v.holder == 'Trial User'
+  and v.days_left == 27 and v.valid_through == '2026-11-17' and v.product == 'Java and Kotlin by IntelliJ IDEA', vim.inspect(v))
+check('trial: message', v.message == 'License is active (Trial)', v.message)
+
+v = licensing.project(CAPTURED_PARKED)
+check('empty store: parked StartedUnlicensed', v.kind == 'parked' and v.parked_reason == 'StartedUnlicensed', vim.inspect(v))
+check('empty store: no license fields', v.source == nil and v.days_left == nil and #v.subscriptions == 0, vim.inspect(v))
+check('empty store: message says to activate', v.message:find('^No active license%. Activate') ~= nil, v.message)
+
+v = licensing.project(lstate({ activeLicense = { source = 'trial', status = 'Expired', product = 'intellij-server', daysLeft = 0, validThrough = '2026-10-19' },
+  graceDeadline = DEADLINE }))
+check('expired with a deadline: grace', v.kind == 'grace' and v.grace_deadline == DEADLINE, vim.inspect(v))
+check('grace message names the time', v.message:find(licensing.format_deadline(DEADLINE), 1, true) ~= nil
+  and v.message:find('^License Expired') ~= nil, v.message)
+check('expired: days left 0 is shown', v.days_left == 0, vim.inspect(v.days_left))
+
+v = licensing.project(lstate({ activeLicense = CAPTURED_TRIAL.activeLicense, graceDeadline = DEADLINE }))
+check('grace deadline next to a valid license is ignored', v.kind == 'licensed' and v.grace_deadline == nil, vim.inspect(v))
+
+v = licensing.project(lstate({ activeLicense = { source = 'trial', status = 'Expired', product = 'intellij-server' },
+  featuresDeclined = true, parkedReason = 'GraceExpired' }))
+check('parked after grace', v.kind == 'parked' and v.parked_reason == 'GraceExpired', vim.inspect(v))
+check('parked after grace: message', v.message == 'License Expired: Java and Kotlin by IntelliJ IDEA. The grace period has ended. '
+  .. 'Activate a license to use Java and Kotlin features.', v.message)
+v = licensing.project(lstate({ featuresDeclined = true, parkedReason = 'LicenseRemoved' }))
+check('parked after removal: message', v.message:find('^The license was removed%. Activate another') ~= nil, v.message)
+
+-- A subscription carries its license id only in the account's subscription list.
+v = licensing.project(lstate({
+  activeLicense = { source = 'subscription', status = 'Valid', product = 'intellij-server', licensedTo = 'Ada Lovelace',
+    daysLeft = 102, validThrough = '2027-01-31', assetId = 'asset-1' },
+  jbaLicensingState = { authenticationStatus = 'Authenticated', accountInfo = { displayName = 'Ada', email = 'ada@example.com' },
+    availableSubscriptions = { SUB } },
+}))
+check('subscription: licensed by the account', v.kind == 'licensed' and v.source_label == 'JetBrains Account'
+  and v.holder == 'Ada Lovelace', vim.inspect(v))
+check('subscription: license id from the account list', v.license_id == 'LIC123', vim.inspect(v.license_id))
+check('subscription: account and list', v.account and v.account.display_name == 'Ada' and v.account.email == 'ada@example.com'
+  and v.subscriptions[1].asset_id == 'asset-1' and v.subscriptions[1].product == 'Java and Kotlin by IntelliJ IDEA', vim.inspect(v))
+
+v = licensing.project(lstate({
+  activeLicense = { source = 'subscription', status = 'Valid', product = 'intellij-server', licensedTo = 'Ada', assetId = 'asset-1' },
+  jbaLicensingState = { authenticationStatus = 'FailedToProlongateAuthentication', accountInfo = { displayName = 'Ada' }, errorMessage = 'x' },
+}))
+check('valid license, session not prolonged: session-expired', v.kind == 'session-expired'
+  and v.message:find('session expired') ~= nil and v.account.display_name == 'Ada', vim.inspect(v))
+
+v = licensing.project(lstate({ jbaLicensingState = { authenticationStatus = 'Authenticating' }, featuresDeclined = true,
+  parkedReason = 'StartedUnlicensed' }))
+check('sign-in under way: authenticating, before parked', v.kind == 'authenticating' and v.authenticating == 'account', vim.inspect(v))
+v = licensing.project(lstate({ activeLicense = CAPTURED_TRIAL.activeLicense, jbaLicensingState = { authenticationStatus = 'Authenticating' } }))
+check('sign-in under a valid trial stays licensed', v.kind == 'licensed', v.kind)
+
+v = licensing.project(lstate({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com',
+  status = 'Unknown', floatingTicketStatus = 'Obtaining' } }))
+check('license server ticket requested: authenticating', v.kind == 'authenticating' and v.authenticating == 'licenseServer'
+  and v.server_address == 'https://fls.example.com' and v.message:find('fls.example.com', 1, true) ~= nil, vim.inspect(v))
+
+v = licensing.project(lstate({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com',
+  status = 'Expired', floatingTicketStatus = 'FailedToRefresh' }, featuresDeclined = true, parkedReason = 'GraceExpired' }))
+check('license server refresh failed: fallback error', v.kind == 'parked' and v.error and v.error:find('^Lost connection') ~= nil, vim.inspect(v))
+v = licensing.project(lstate({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com',
+  status = 'Unknown', floatingTicketStatus = 'NotObtained', errorMessage = '  No free seats  ' } }))
+check('license server error message is trimmed', v.error == 'No free seats', vim.inspect(v.error))
+v = licensing.project(lstate({ jbaLicensingState = { authenticationStatus = 'FailedToAuthenticate', availableSubscriptions = { SUB },
+  errorMessage = 'raw backend text' } }))
+check('sign-in failed: fixed sentence, not the raw message', v.error and v.error:find("^Couldn't sign in") ~= nil
+  and #v.subscriptions == 1, vim.inspect(v))
+
+v = licensing.project(lstate({ activeLicense = { source = 'activationCode', status = 'Invalid', product = 'intellij-server',
+  licensedTo = 'Ada', licenseId = 'AC1' } }))
+check('invalid code, not yet parked: unlicensed', v.kind == 'unlicensed' and v.license_id == 'AC1'
+  and v.message == 'License Invalid: Java and Kotlin by IntelliJ IDEA', vim.inspect(v))
+
+v = licensing.project(lstate({ activeLicense = { source = 'eap', status = 'Valid', product = 'intellij-server', daysLeft = 0 } }))
+check('eap: 0 days without an end date is not counted down', v.kind == 'licensed' and v.days_left == nil
+  and v.holder == 'Early Access Program' and v.message == 'EAP license is active', vim.inspect(v))
+v = licensing.project(lstate({ activeLicense = { source = 'licenseServer', status = 'Valid', product = 'goland',
+  serverAddress = 'https://fls.example.com' } }))
+check('license server: holder is the address, unknown product kept', v.holder == 'https://fls.example.com' and v.product == 'goland', vim.inspect(v))
+
+-- A null that does arrive must read as missing, not as a truthy vim.NIL.
+v = licensing.project(lstate({ activeLicense = vim.NIL, graceDeadline = vim.NIL, parkedReason = vim.NIL }))
+check('null fields read as missing', v.kind == 'unlicensed' and v.source == nil and v.grace_deadline == nil, vim.inspect(v))
+
+-- Store: one copy per client, an event on change only, dropped on exit.
+do
+  local events = {}
+  local au = vim.api.nvim_create_autocmd('User', {
+    pattern = licensing.EVENT,
+    callback = function(ev) table.insert(events, ev.data) end,
+  })
+  local push = licensing.handlers()[licensing.STATE]
+  push(nil, CAPTURED_PARKED, { client_id = 9001 })
+  check('push stored', licensing.state(9001) and licensing.state(9001).parkedReason == 'StartedUnlicensed')
+  check('push fires the event with the view', #events == 1 and events[1].client_id == 9001 and events[1].view.kind == 'parked',
+    vim.inspect(events))
+  push(nil, vim.deepcopy(CAPTURED_PARKED), { client_id = 9001 })
+  check('an identical push fires nothing', #events == 1, #events)
+  push(nil, lstate({ activeLicense = CAPTURED_TRIAL.activeLicense, graceDeadline = DEADLINE }), { client_id = 9001 })
+  check('a changed push fires again', #events == 2 and events[2].view.kind == 'licensed', vim.inspect(events[2]))
+  check('stored state drops a grace deadline next to a valid license', licensing.state(9001).graceDeadline == nil,
+    vim.inspect(licensing.state(9001)))
+  check('other clients are separate', licensing.state(9002) == nil and licensing.view(9002) == nil)
+  licensing.reset(9001)
+  check('reset drops the state', licensing.state(9001) == nil)
+  check('reset fires the event without a view', #events == 3 and events[3].client_id == 9001 and events[3].view == nil, vim.inspect(events[3]))
+  licensing.reset(9001)
+  check('a second reset fires nothing', #events == 3, #events)
+  vim.api.nvim_del_autocmd(au)
+end
+
+-- Requests: gated on the server's capability, one parameter each where taken, a timeout.
+do
+  local sent, cancelled = {}, {}
+  local pending = {}
+  local function fake(id, supported)
+    return {
+      id = id,
+      server_capabilities = { experimental = { licensing = supported } },
+      request = function(_, method, params, handler)
+        table.insert(sent, { method = method, params = params })
+        pending[#sent] = handler
+        return true, #sent
+      end,
+      cancel_request = function(_, rid) table.insert(cancelled, rid) end,
+    }
+  end
+
+  local got
+  licensing.request(fake(9010, false), 'state/get', nil, function(err) got = err end)
+  vim.wait(500, function() return got ~= nil end, 10)
+  check('no licensing on a server without the capability', #sent == 0 and got and got.message:find('does not support') ~= nil, vim.inspect(got))
+  check('supported reads the server capability', licensing.supported(fake(1, true)) and not licensing.supported(fake(1, nil))
+    and not licensing.supported(nil))
+
+  local c = fake(9011, true)
+  licensing.request(c, 'subscriptions/use', 'asset-1', function() end)
+  check('request goes to jetbrains/licensing/', sent[1].method == 'jetbrains/licensing/subscriptions/use', sent[1].method)
+  check('the single parameter is named', sent[1].params.assetId == 'asset-1', vim.inspect(sent[1].params))
+  licensing.request(c, 'trial/startAnonymous', nil, function() end)
+  check('a parameterless request sends an empty object', vim.json.encode(sent[2].params) == '{}', vim.json.encode(sent[2].params))
+  check('a missing parameter is a programming error', not pcall(licensing.request, c, 'activationCode/use', nil, function() end))
+  check('an unknown request is a programming error', not pcall(licensing.request, c, 'trial/start', nil, function() end))
+  check('login waits out the server sign-in', licensing.REQUESTS['jba/login'].timeout == 310000
+    and licensing.REQUESTS['licenseServer/add'].timeout == 360000 and licensing.REQUESTS['jba/logout'].timeout == 30000)
+
+  -- Answered: the callback runs once, and a late timeout does not run it again.
+  local calls = {}
+  licensing.REQUESTS['state/get'].timeout = 50
+  licensing.request(c, 'state/get', nil, function(err, result) table.insert(calls, { err = err, result = result }) end)
+  pending[#sent](nil, CAPTURED_TRIAL, {})
+  vim.wait(150, function() return false end, 10)
+  check('an answered request calls back once', #calls == 1 and calls[1].result == CAPTURED_TRIAL and #cancelled == 0, vim.inspect(calls))
+
+  -- Unanswered: a timeout error, the request cancelled, and the late reply ignored.
+  calls = {}
+  licensing.request(c, 'state/get', nil, function(err, result) table.insert(calls, { err = err, result = result }) end)
+  local rid = #sent
+  vim.wait(1000, function() return #calls > 0 end, 10)
+  check('an unanswered request times out', #calls == 1 and calls[1].err and calls[1].err.code == licensing.TIMED_OUT, vim.inspect(calls))
+  check('the timed-out request is cancelled', cancelled[1] == rid, vim.inspect(cancelled))
+  pending[rid](nil, CAPTURED_TRIAL, {})
+  check('a reply after the timeout is ignored', #calls == 1, #calls)
+
+  -- refresh: the reply is recorded, unless a push overtook it.
+  local view
+  licensing.refresh(c, function(_, vw) view = vw end)
+  pending[#sent](nil, CAPTURED_TRIAL, {})
+  check('refresh records the reply', view and view.kind == 'licensed' and licensing.state(9011) ~= nil, vim.inspect(view))
+  licensing.refresh(c, function(_, vw) view = vw end)
+  local in_flight = #sent
+  licensing.handlers()[licensing.STATE](nil, CAPTURED_PARKED, { client_id = 9011 })
+  pending[in_flight](nil, CAPTURED_TRIAL, {})
+  check('a push during state/get wins over the reply', view and view.kind == 'parked', vim.inspect(view))
+  licensing.REQUESTS['state/get'].timeout = 10000
+  licensing.reset(9011)
+end
+
+-- Environment licenses: the server's own, which nothing activated here overrides.
+check('no environment license', licensing.environment_license({ HOME = '/home/x' }) == nil
+  and licensing.environment_license(nil) == nil)
+check('a blank variable is no environment license', licensing.environment_license({ INTELLIJ_SERVER_LICENSE = '  ' }) == nil)
+check('INTELLIJ_SERVER_LICENSE_FILE is an environment license',
+  licensing.environment_license({ INTELLIJ_SERVER_LICENSE_FILE = '/etc/key' }) == 'INTELLIJ_SERVER_LICENSE_FILE')
+check('JETBRAINS_LICENSE_SERVER is an environment license',
+  licensing.environment_license({ JETBRAINS_LICENSE_SERVER = 'https://fls.example' }) == 'JETBRAINS_LICENSE_SERVER')
+check('the environment message names the variable and the restart',
+  licensing.environment_message('INTELLIJ_SERVER_LICENSE'):find('INTELLIJ_SERVER_LICENSE, which overrides', 1, true) ~= nil
+  and licensing.environment_message('INTELLIJ_SERVER_LICENSE'):find(':IntellijLspRestart', 1, true) ~= nil)
+
+-- Startup: state/get, discovery when there is no license, one activation offer per session.
+do
+  local sent, offers = {}, {}
+  local orig_offer = licensing.offer_activation
+  licensing.offer_activation = function(c, view, env_var)
+    table.insert(offers, { id = c.id, kind = view.kind, env_var = env_var })
+  end
+  licensing._reset_session()
+
+  --- Answers each request with `replies[method]`; a function reply runs first (to push) and returns
+  --- the result.
+  local function fake(id, replies, env)
+    return {
+      id = id,
+      server_capabilities = { experimental = { licensing = true } },
+      config = { cmd = { '/b/bin/intellij-server' }, cmd_env = env or {} },
+      request = function(_, method, _, handler)
+        local name = method:gsub('^jetbrains/licensing/', '')
+        table.insert(sent, { id = id, name = name })
+        local reply = replies[name]
+        vim.schedule(function()
+          if type(reply) == 'function' then reply = reply() end
+          handler(nil, reply, {})
+        end)
+        return true, #sent
+      end,
+      cancel_request = function() end,
+    }
+  end
+  local function names(id)
+    local out = {}
+    for _, s in ipairs(sent) do if s.id == id then table.insert(out, s.name) end end
+    return table.concat(out, ',')
+  end
+  local function run(c)
+    local done, view = false, nil
+    licensing.startup(c, function(vw) done, view = true, vw end)
+    vim.wait(1000, function() return done end, 5)
+    return done, view
+  end
+
+  local done, view = run(fake(9101, { ['state/get'] = CAPTURED_TRIAL }))
+  check('startup: a licensed server only gets state/get', done and names(9101) == 'state/get' and #offers == 0,
+    names(9101) .. ' ' .. vim.inspect(offers))
+  check('startup: the state is recorded', view and view.kind == 'licensed', vim.inspect(view))
+
+  done, view = run(fake(9102, { ['state/get'] = CAPTURED_PARKED, ['discovery/autoActivate'] = { activated = false } }))
+  check('startup: no license -> discovery/autoActivate', names(9102) == 'state/get,discovery/autoActivate', names(9102))
+  check('startup: still parked -> the activation is offered', #offers == 1 and offers[1].id == 9102
+    and offers[1].kind == 'parked' and offers[1].env_var == nil, vim.inspect(offers))
+
+  run(fake(9103, { ['state/get'] = CAPTURED_PARKED, ['discovery/autoActivate'] = { activated = false } }))
+  check('startup: a second unlicensed root still syncs', names(9103) == 'state/get,discovery/autoActivate', names(9103))
+  check('startup: but the activation is offered once per session', #offers == 1, vim.inspect(offers))
+  licensing.offer_withdrawn()
+  run(fake(9104, { ['state/get'] = CAPTURED_PARKED, ['discovery/autoActivate'] = { activated = false } }))
+  check('startup: an offer withdrawn before it showed is made again', #offers == 2 and offers[2].id == 9104,
+    vim.inspect(offers))
+
+  licensing._reset_session()
+  offers = {}
+  done, view = run(fake(9104, {
+    ['state/get'] = CAPTURED_PARKED,
+    ['discovery/autoActivate'] = function()
+      -- The server pushes the activated state before it replies.
+      licensing.handlers()[licensing.STATE](nil, CAPTURED_TRIAL, { client_id = 9104 })
+      return { activated = true, source = 'toolbox' }
+    end,
+  }))
+  check('startup: discovery found a license -> nothing offered', #offers == 0 and view and view.kind == 'licensed',
+    vim.inspect(offers) .. ' ' .. vim.inspect(view))
+
+  local EXPIRED = lstate({ activeLicense = vim.tbl_extend('force', SUB, { status = 'Expired' }), featuresDeclined = true,
+    parkedReason = 'GraceExpired' })
+  run(fake(9105, { ['state/get'] = EXPIRED }, { JETBRAINS_LICENSE_SERVER = 'https://fls.example' }))
+  check('startup: an existing license skips discovery', names(9105) == 'state/get', names(9105))
+  check('startup: an environment license is named in the offer', #offers == 1 and offers[1].env_var == 'JETBRAINS_LICENSE_SERVER',
+    vim.inspect(offers))
+
+  licensing._reset_session()
+  offers = {}
+  run(fake(9106, { ['state/get'] = lstate({ graceDeadline = DEADLINE, featuresDeclined = false }) }))
+  check('startup: a grace period is not offered', #offers == 0, vim.inspect(offers))
+
+  local plain = fake(9107, {})
+  plain.server_capabilities = {}
+  done = run(plain)
+  check('startup: a server without the protocol gets nothing', done and names(9107) == '', names(9107))
+
+  -- A slow discovery shows "Checking license…" and closes it with the outcome.
+  local echoes = {}
+  local orig_echo = vim.api.nvim_echo
+  vim.api.nvim_echo = function(chunks, _, opts)
+    table.insert(echoes, { text = chunks[1][1], status = opts.status, id = opts.id })
+    return 77
+  end
+  licensing.DISCOVERY_PROGRESS_DELAY = 10
+  local slow = fake(9108, { ['state/get'] = CAPTURED_PARKED })
+  local discovery_reply
+  local request = slow.request
+  slow.request = function(self, method, params, handler)
+    if method:find('autoActivate') then
+      table.insert(sent, { id = 9108, name = 'discovery/autoActivate' })
+      discovery_reply = handler
+      return true, #sent
+    end
+    return request(self, method, params, handler)
+  end
+  licensing.startup(slow)
+  vim.wait(1000, function() return #echoes > 0 end, 5)
+  check('startup: a slow discovery shows Checking license…', echoes[1] and echoes[1].text == 'Checking license…'
+    and echoes[1].status == 'running', vim.inspect(echoes))
+  if discovery_reply then discovery_reply(nil, { activated = false }, {}) end
+  check('startup: and closes it with the outcome', echoes[2] and echoes[2].id == 77 and echoes[2].text == 'No license found'
+    and echoes[2].status == 'failed', vim.inspect(echoes))
+
+  echoes = {}
+  licensing.DISCOVERY_PROGRESS_DELAY = 100
+  run(fake(9109, { ['state/get'] = CAPTURED_PARKED, ['discovery/autoActivate'] = { activated = false } }))
+  vim.wait(200, function() return false end, 10)
+  check('startup: a fast discovery shows nothing', #echoes == 0, vim.inspect(echoes))
+  vim.api.nvim_echo = orig_echo
+  licensing.DISCOVERY_PROGRESS_DELAY = 500
+
+  for id = 9101, 9109 do licensing.reset(id) end
+  licensing.offer_activation = orig_offer
+  licensing._reset_session()
+end
+
+-- The interim offer names the CLI of the running bundle, or the variable that owns the license.
+do
+  local notified = {}
+  local orig_notify = vim.notify
+  vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
+  local c = { config = { cmd = { '/b/bin/intellij-server' } } }
+  licensing.offer_activation(c, licensing.project(CAPTURED_PARKED), nil)
+  licensing.offer_activation(c, licensing.project(CAPTURED_PARKED), 'INTELLIJ_SERVER_LICENSE')
+  vim.notify = orig_notify
+  check('offer: warns with the state and the CLI', notified[1] and notified[1].level == vim.log.levels.WARN
+    and notified[1].msg:find('No active license.', 1, true) ~= nil
+    and notified[1].msg:find('/b/bin/intellij-server license trial', 1, true) ~= nil, vim.inspect(notified[1]))
+  check('offer: with an environment license, says why instead', notified[2]
+    and notified[2].msg:find('INTELLIJ_SERVER_LICENSE, which overrides', 1, true) ~= nil
+    and notified[2].msg:find('license trial', 1, true) == nil, vim.inspect(notified[2]))
+end
+end)()
+
+-- ---------------------------------------------------------------------------
+-- Activation: the float, and the result mapping of each way to activate
+-- ---------------------------------------------------------------------------
+;(function()
+local licensing = require('intellij-lsp.licensing')
+local activation = require('intellij-lsp.activation')
+
+local function lstate(t)
+  return vim.tbl_extend('force', {
+    jbaLicensingState = { authenticationStatus = 'NotAuthenticated' },
+    licenseServerFlowState = { kind = 'notConfigured' },
+    featuresDeclined = false,
+  }, t)
+end
+local PARKED = lstate({ featuresDeclined = true, parkedReason = 'StartedUnlicensed' })
+local TRIAL = { source = 'trial', status = 'Valid', product = 'intellij-server', daysLeft = 30, validThrough = '2026-11-19' }
+local ACCOUNT = { authenticationStatus = 'Authenticated', accountInfo = { displayName = 'Ada' }, availableSubscriptions = {} }
+local function sub(asset, status)
+  return { kind = 'Subscription', licensedTo = 'Ada', product = 'intellij-server', validThrough = '2027-01-31',
+    licenseId = 'L-' .. asset, assetId = asset, status = status or 'Valid' }
+end
+
+-- Menu entries
+local function keys(actions) return table.concat(vim.tbl_map(function(a) return a.key end, actions)) end
+check('activation: all four entries', keys(activation.actions({})) == '1234', keys(activation.actions({})))
+check('activation: changing a license hides the trial', keys(activation.actions({ change = true })) == '123'
+  and activation.actions({ change = true })[1].name == 'login')
+check('activation: an environment license leaves the license server', keys(activation.actions({ environment = true })) == '1'
+  and activation.actions({ environment = true })[1].name == 'server')
+local lines, first = activation._lines(licensing.project(PARKED), activation.actions({}), 'INTELLIJ_SERVER_LICENSE')
+check('activation: the float says what is wrong, why, then the entries',
+  lines[1]:find('No active license', 1, true) and lines[2]:find('INTELLIJ_SERVER_LICENSE, which overrides', 1, true)
+  and lines[3] == '' and first == 4 and lines[4] == ' 1  Start 30-day trial' and lines[5] == ' 2  Sign in with JetBrains Account' and lines[7] == ' 4  Use a license server',
+  vim.inspect(lines))
+
+check('activation: license server URLs', activation.valid_server_url('https://fls.example.com')
+  and activation.valid_server_url('  HTTP://fls:8080/path ') and not activation.valid_server_url('fls.example.com')
+  and not activation.valid_server_url('ftp://fls') and not activation.valid_server_url('https://')
+  and not activation.valid_server_url('https://fls example'))
+check('activation: a pasted code loses its line breaks and spaces', activation.clean_code(' ABC-\n DEF\r\n-GHI ') == 'ABC-DEF-GHI')
+
+-- A fake server: `replies[name]` is the result, or a function of the params that may push first.
+local sent, notified = {}, {}
+local orig_notify = vim.notify
+vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
+local function fake(id, replies)
+  local c = {
+    id = id,
+    server_capabilities = { experimental = { licensing = true } },
+    config = { cmd = { '/b/bin/intellij-server' }, cmd_env = {} },
+    is_stopped = function() return false end,
+    cancel_request = function() end,
+  }
+  c.request = function(_, method, params, handler)
+    local name = method:gsub('^jetbrains/licensing/', '')
+    table.insert(sent, { id = id, name = name, params = params })
+    local reply = replies[name]
+    if reply == 'never' then return true, #sent end
+    vim.schedule(function()
+      local err
+      if type(reply) == 'function' then reply, err = reply(params) end
+      handler(err, reply, {})
+    end)
+    return true, #sent
+  end
+  return c
+end
+local function push(id, state) licensing.handlers()[licensing.STATE](nil, state, { client_id = id }) end
+local function names(id)
+  local out = {}
+  for _, s in ipairs(sent) do if s.id == id then table.insert(out, s.name) end end
+  return table.concat(out, ',')
+end
+local function result_of(fn, ...)
+  local got
+  local args = { ... }
+  table.insert(args, function(ok, message) got = { ok = ok, message = message } end)
+  fn(unpack(args))
+  vim.wait(1000, function() return got ~= nil end, 5)
+  return got or {}
+end
+local function last() return notified[#notified] or {} end
+
+-- Trial
+local c = fake(9201, { ['trial/startAnonymous'] = function() push(9201, lstate({ activeLicense = TRIAL })) return { isSuccess = true } end })
+push(9201, PARKED)
+local r = result_of(activation.trial, c)
+check('trial: success reports the license now active', r.ok and last().msg == 'IntelliJ LSP: License is active (Trial)'
+  and last().level == vim.log.levels.INFO, vim.inspect(notified))
+check('trial: not signed in -> no sign-out', names(9201) == 'trial/startAnonymous', names(9201))
+
+c = fake(9202, { ['trial/startAnonymous'] = function()
+  push(9202, lstate({ activeLicense = TRIAL, jbaLicensingState = ACCOUNT }))
+  return { isSuccess = true }
+end, ['jba/logout'] = vim.NIL })
+push(9202, lstate({ jbaLicensingState = ACCOUNT, featuresDeclined = true }))
+r = result_of(activation.trial, c)
+vim.wait(200, function() return names(9202):find('logout') ~= nil end, 5)
+check('trial: signed in to an account -> signed out once the trial is valid', r.ok and names(9202) == 'trial/startAnonymous,jba/logout', names(9202))
+
+c = fake(9203, { ['trial/startAnonymous'] = { isSuccess = false, errorMessage = ' Trial already used ' } })
+r = result_of(activation.trial, c)
+check('trial: refused -> the sentence and the server reason', not r.ok
+  and r.message == "Couldn't start your trial. Try again. Trial already used" and last().level == vim.log.levels.ERROR, vim.inspect(r))
+
+-- Activation code
+c = fake(9204, { ['activationCode/use'] = false })
+r = result_of(activation.use_code, c, 'BAD\nCODE')
+check('code: rejected', not r.ok and r.message == activation.CODE_REJECTED, vim.inspect(r))
+check('code: sent without whitespace', sent[#sent].params.activationCode == 'BADCODE', vim.inspect(sent[#sent].params))
+c = fake(9205, { ['activationCode/use'] = function()
+  push(9205, lstate({ activeLicense = { source = 'activationCode', status = 'Valid', product = 'intellij-server', licensedTo = 'Ada', licenseId = 'AC' },
+    jbaLicensingState = ACCOUNT }))
+  return true
+end, ['jba/logout'] = vim.NIL })
+r = result_of(activation.use_code, c, 'GOOD')
+vim.wait(200, function() return names(9205):find('logout') ~= nil end, 5)
+check('code: accepted, and the account signed out', r.ok and names(9205) == 'activationCode/use,jba/logout'
+  and last().msg:find('Activation Code', 1, true), names(9205) .. ' ' .. vim.inspect(last()))
+local before = #sent
+r = result_of(activation.use_code, c, ' \n ')
+check('code: an empty code sends nothing', not r.ok and #sent == before)
+
+-- License server
+c = fake(9206, {})
+r = result_of(activation.add_server, c, 'fls.example.com')
+check('server: a URL without a scheme is not sent', not r.ok and r.message == activation.SERVER_URL_INVALID and names(9206) == '')
+local function server(id, reply, pre)
+  local fc = fake(id, { ['licenseServer/add'] = reply, ['jba/logout'] = vim.NIL })
+  if pre then push(id, pre) end
+  return result_of(activation.add_server, fc, ' https://fls.example.com ')
+end
+local LS = { source = 'licenseServer', status = 'Valid', product = 'intellij-server', serverAddress = 'https://fls.example.com' }
+r = server(9207, function(params)
+  push(9207, lstate({ activeLicense = LS, licenseServerFlowState = { kind = 'configured', serverAddress = params.serverAddress,
+    status = 'Valid', floatingTicketStatus = 'Obtained' } }))
+  return { status = 'Connected' }
+end)
+check('server: connected', r.ok and sent[#sent].params.serverAddress == 'https://fls.example.com', vim.inspect(r))
+r = server(9208, function()
+  push(9208, lstate({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com', status = 'Unknown',
+    floatingTicketStatus = 'NotObtained', errorMessage = 'No free seats' } }))
+  return { status = 'Connected' }
+end)
+check('server: connected but refused -> the server error', not r.ok and r.message == 'No free seats', vim.inspect(r))
+r = server(9209, { status = 'Canceled' })
+check('server: canceled is silent', not r.ok and r.message == nil, vim.inspect(r))
+r = server(9210, { status = 'TimedOut' })
+check('server: timed out', r.message == 'Sign-in to the license server timed out. Try again.', vim.inspect(r))
+r = server(9211, { status = 'Failed', errorMessage = '  Unknown host  ' })
+check('server: failed -> the trimmed server message', r.message == 'Unknown host', vim.inspect(r))
+r = server(9212, { status = 'Failed' })
+check('server: failed without a message -> the sentence', r.message and r.message:find("^Couldn't activate with the license server") ~= nil, vim.inspect(r))
+r = server(9213, { status = 'Failed', errorMessage = 'Failed to open the sign-in page' })
+check('server: the sign-in page did not open -> silent', r.message == nil, vim.inspect(r))
+
+-- Signed in before: the account is signed out once the server's ticket arrives, even after the reply.
+r = server(9214, function(params)
+  push(9214, lstate({ jbaLicensingState = ACCOUNT, licenseServerFlowState = { kind = 'configured', serverAddress = params.serverAddress,
+    status = 'Unknown', floatingTicketStatus = 'Obtaining' } }))
+  return { status = 'Connected' }
+end, lstate({ jbaLicensingState = ACCOUNT, featuresDeclined = true }))
+check('server: no sign-out before the license is valid', names(9214) == 'licenseServer/add', names(9214))
+push(9214, lstate({ activeLicense = LS, jbaLicensingState = ACCOUNT, licenseServerFlowState = { kind = 'configured',
+  serverAddress = 'https://fls.example.com', status = 'Valid', floatingTicketStatus = 'Obtained' } }))
+vim.wait(200, function() return names(9214):find('logout') ~= nil end, 5)
+check('server: signed out once the license server licenses', names(9214) == 'licenseServer/add,jba/logout', names(9214))
+push(9214, lstate({ activeLicense = LS }))
+vim.wait(50, function() return false end, 5)
+check('server: and only once', names(9214) == 'licenseServer/add,jba/logout', names(9214))
+
+-- JetBrains Account sign-in
+local function signin(id, reply, extra)
+  local replies = vim.tbl_extend('force', { ['jba/login'] = reply, ['jba/logout'] = vim.NIL }, extra or {})
+  return result_of(activation.login, fake(id, replies))
+end
+r = signin(9220, function()
+  push(9220, lstate({ activeLicense = { source = 'subscription', status = 'Valid', product = 'intellij-server', licensedTo = 'Ada', assetId = 'a' },
+    jbaLicensingState = ACCOUNT }))
+  return { status = 'Licensed' }
+end)
+check('login: licensed', r.ok and last().msg:find('JetBrains Account', 1, true), vim.inspect(r))
+check('login: no sign-in left pending', not activation.login_pending())
+
+r = signin(9221, function()
+  push(9221, lstate({ jbaLicensingState = vim.tbl_extend('force', ACCOUNT, { availableSubscriptions = { sub('x', 'Expired'), sub('a1') } }),
+    featuresDeclined = true }))
+  return { status = 'NoSuitableLicense' }
+end, { ['subscriptions/use'] = function(params)
+  push(9221, lstate({ activeLicense = { source = 'subscription', status = 'Valid', product = 'intellij-server', licensedTo = 'Ada',
+    assetId = params.assetId }, jbaLicensingState = ACCOUNT }))
+  return vim.NIL
+end })
+check('login: one valid subscription -> activated', r.ok and names(9221) == 'jba/login,subscriptions/use'
+  and sent[#sent].params.assetId == 'a1', names(9221) .. ' ' .. vim.inspect(r))
+
+local orig_choose, offered_items = activation.choose, nil
+activation.choose = function(opts, on_choice)
+  offered_items = vim.tbl_map(opts.format, opts.items)
+  on_choice(opts.items[2], 2)
+end
+r = signin(9222, function()
+  push(9222, lstate({ jbaLicensingState = vim.tbl_extend('force', ACCOUNT, { availableSubscriptions = { sub('a1'), sub('a2') } }),
+    featuresDeclined = true }))
+  return { status = 'NoSuitableLicense' }
+end, { ['subscriptions/use'] = vim.NIL })
+check('login: several -> picked', offered_items and #offered_items == 2
+  and offered_items[1] == 'Java and Kotlin by IntelliJ IDEA, Ada, valid through 2027-01-31'
+  and sent[#sent].params.assetId == 'a2', vim.inspect(offered_items))
+check('login: a subscription that does not become active is a failure', not r.ok
+  and r.message == "Couldn't activate a subscription from this JetBrains Account. Try again.", vim.inspect(r))
+activation.choose = function(_, on_choice) on_choice(nil, nil) end
+r = signin(9223, function()
+  push(9223, lstate({ jbaLicensingState = vim.tbl_extend('force', ACCOUNT, { availableSubscriptions = { sub('a1'), sub('a2') } }),
+    featuresDeclined = true }))
+  return { status = 'NoSuitableLicense' }
+end)
+check('login: picker dismissed -> warned, still signed in', not r.ok and last().level == vim.log.levels.WARN
+  and names(9223) == 'jba/login', names(9223) .. ' ' .. vim.inspect(r))
+activation.choose = orig_choose
+
+r = signin(9224, function()
+  push(9224, lstate({ jbaLicensingState = vim.tbl_extend('force', ACCOUNT, { availableSubscriptions = { sub('x', 'Expired') } }),
+    featuresDeclined = true }))
+  return { status = 'NoSuitableLicense' }
+end)
+vim.wait(200, function() return names(9224):find('logout') ~= nil end, 5)
+check('login: no valid subscription -> signed out and warned', names(9224) == 'jba/login,jba/logout'
+  and r.message == 'No licenses available for activation were found in the JetBrains Account.' and last().level == vim.log.levels.WARN,
+  names(9224) .. ' ' .. vim.inspect(r))
+
+r = signin(9225, { status = 'NoLicenses' })
+check('login: NoLicenses warns', r.message and r.message:find('^No licenses available') ~= nil and last().level == vim.log.levels.WARN)
+r = signin(9226, { status = 'LicenseCheckFailed' })
+check('login: LicenseCheckFailed warns', r.message == "Couldn't check licenses in the JetBrains Account. Try again.")
+before = #notified
+r = signin(9227, { status = 'Canceled' })
+check('login: Canceled is silent', not r.ok and r.message == nil and #notified == before)
+r = signin(9228, { status = 'TimedOut' })
+check('login: TimedOut is an error', r.message == licensing.ACCOUNT_AUTH_FAILED and last().level == vim.log.levels.ERROR)
+r = signin(9229, { status = 'Failed', errorMessage = 'Failed to open the sign-in page' })
+check('login: the sign-in page did not open -> silent', r.message == nil)
+r = signin(9230, { status = 'Failed', errorMessage = 'boom' })
+check('login: other failures -> the fixed sentence', r.message == licensing.ACCOUNT_AUTH_FAILED)
+push(9231, lstate({ jbaLicensingState = { authenticationStatus = 'Authenticating' }, featuresDeclined = true }))
+r = signin(9231, function() return nil, { code = licensing.TIMED_OUT, message = 'jba/login did not answer' } end)
+vim.wait(200, function() return names(9231):find('logout') ~= nil end, 5)
+check('login: our wait ran out while authenticating -> signed out, error', names(9231) == 'jba/login,jba/logout'
+  and r.message == licensing.ACCOUNT_AUTH_FAILED, names(9231))
+
+-- Starting something else cancels a pending sign-in: jba/logout first, then the sign-in reply is dropped.
+local login_handler
+c = fake(9232, { ['jba/logout'] = vim.NIL, ['trial/startAnonymous'] = { isSuccess = false } })
+local request = c.request
+c.request = function(self, method, params, handler)
+  if method:find('jba/login') then
+    table.insert(sent, { id = 9232, name = 'jba/login' })
+    login_handler = handler
+    return true, #sent
+  end
+  return request(self, method, params, handler)
+end
+local login_result
+activation.login(c, function(ok, message) login_result = { ok = ok, message = message } end)
+check('login: pending while the browser is open', activation.login_pending())
+r = result_of(activation.trial, c)
+check('cancel: another activation signs out first', names(9232) == 'jba/login,jba/logout,trial/startAnonymous'
+  and not activation.login_pending(), names(9232))
+before = #notified
+login_handler(nil, { status = 'Canceled' }, {})
+check('cancel: the cancelled sign-in reports nothing', login_result and not login_result.ok and login_result.message == nil
+  and #notified == before, vim.inspect(login_result))
+
+-- The float: a digit runs its entry, q is "Later", hidden entries have no key.
+local started = {}
+local orig = { trial = activation.trial, login = activation.login, ask_code = activation.ask_code }
+activation.trial = function(fc) table.insert(started, 'trial:' .. fc.id) end
+activation.ask_code = function(fc) table.insert(started, 'code:' .. fc.id) end
+activation.login = function(fc) table.insert(started, 'login:' .. fc.id) end
+c = fake(9240, {})
+push(9240, PARKED)
+local win = activation.open(c)
+check('float: opens focused with the state and the entries', win and vim.api.nvim_get_current_win() == win
+  and vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)[3] == ' 1  Start 30-day trial')
+check('float: a second open focuses the same float', activation.open(c) == win)
+vim.api.nvim_feedkeys('1', 'x', false)
+vim.wait(200, function() return #started > 0 end, 5)
+check('float: 1 starts the trial', started[1] == 'trial:9240' and not vim.api.nvim_win_is_valid(win), vim.inspect(started))
+
+local later = 0
+win = activation.open(c, { on_later = function() later = later + 1 end })
+vim.api.nvim_feedkeys('q', 'x', false)
+vim.wait(200, function() return later > 0 end, 5)
+check('float: q is later', later == 1 and not vim.api.nvim_win_is_valid(win))
+
+started = {}
+win = activation.open(c, { change = true })
+vim.api.nvim_feedkeys('1', 'x', false)
+vim.wait(200, function() return #started > 0 end, 5)
+check('float: changing a license has no trial, 1 signs in', started[1] == 'login:9240' and not vim.api.nvim_win_is_valid(win),
+  vim.inspect(started))
+
+started = {}
+win = activation.open(c, { change = true })
+vim.api.nvim_feedkeys('j', 'x', false)
+vim.api.nvim_feedkeys(vim.keycode('<CR>'), 'x', false)
+vim.wait(200, function() return #started > 0 end, 5)
+check('float: <CR> runs the entry under the cursor', started[1] == 'code:9240', vim.inspect(started))
+activation._reset()
+
+-- The startup offer waits for normal mode, and shows nothing once a license became valid.
+local orig_mode, orig_open = vim.api.nvim_get_mode, activation.open
+local mode, opened = 'i', {}
+vim.api.nvim_get_mode = function() return { mode = mode, blocking = false } end
+activation.open = function(fc) table.insert(opened, fc.id) end
+activation.offer(c)
+vim.wait(100, function() return false end, 5)
+check('offer: waits while in insert mode', #opened == 0)
+mode = 'n'
+vim.wait(1000, function() return #opened > 0 end, 10)
+check('offer: opens once back in normal mode', opened[1] == 9240, vim.inspect(opened))
+push(9240, lstate({ activeLicense = TRIAL }))
+opened = {}
+activation.offer(c)
+check('offer: a license that became valid shows nothing', #opened == 0)
+push(9240, PARKED)
+local orig_withdrawn, withdrawn = licensing.offer_withdrawn, 0
+licensing.offer_withdrawn = function() withdrawn = withdrawn + 1 end
+activation.offer(vim.tbl_extend('force', c, { is_stopped = function() return true end }))
+check('offer: a server stopped before the float showed hands the offer back', #opened == 0 and withdrawn == 1)
+licensing.offer_withdrawn = orig_withdrawn
+
+-- With a UI, the startup offer is the float rather than the CLI hint.
+local orig_uis = vim.api.nvim_list_uis
+vim.api.nvim_list_uis = function() return { {} } end
+push(9240, PARKED)
+before = #notified
+licensing.offer_activation(c, licensing.project(PARKED), nil)
+check('offer: with a UI, the float and no warning', opened[1] == 9240 and #notified == before, vim.inspect(opened))
+vim.api.nvim_list_uis = orig_uis
+vim.api.nvim_get_mode, activation.open = orig_mode, orig_open
+activation.trial, activation.login, activation.ask_code = orig.trial, orig.login, orig.ask_code
+
+vim.notify = orig_notify
+for id = 9201, 9240 do licensing.reset(id) end
+activation._reset()
+end)()
+
+-- ---------------------------------------------------------------------------
+-- Sign-in pages, and the paste-code sign-in for remote machines
+-- ---------------------------------------------------------------------------
+;(function()
+local licensing = require('intellij-lsp.licensing')
+local activation = require('intellij-lsp.activation')
+local signin = require('intellij-lsp.signin')
+
+-- Remote: the server CLI's rule, so both pick the same sign-in.
+check('remote: SSH_CONNECTION', signin.remote({ SSH_CONNECTION = '1 2 3 4', DISPLAY = ':0' }, 'Linux'))
+check('remote: SSH_TTY on a Mac', signin.remote({ SSH_TTY = '/dev/ttys001' }, 'Darwin'))
+check('remote: a Mac without DISPLAY is local', not signin.remote({}, 'Darwin'))
+check('remote: Windows is local', not signin.remote({}, 'Windows_NT'))
+check('remote: Linux without a display', signin.remote({ DISPLAY = '' }, 'Linux'))
+check('remote: Linux with X11 or Wayland is local', not signin.remote({ DISPLAY = ':0' }, 'Linux')
+  and not signin.remote({ WAYLAND_DISPLAY = 'wayland-0' }, 'Linux'))
+
+check('login cmd: paste-code', table.concat(signin.login_cmd('/b/bin/intellij-server', true), ' ') == '/b/bin/intellij-server license login --code')
+check('login cmd: the CLI picks', table.concat(signin.login_cmd('/b/bin/intellij-server', false), ' ') == '/b/bin/intellij-server license login')
+
+-- The CLI's URL, as 263.7084.0 prints it: unencoded spaces in the query.
+local CLI_URL = 'https://account.jetbrains.com/oauth/login?client_id=ide&scope=openid offline_access r_ide_auth&state=aa'
+check('cli url: none before its line is complete', signin._sign_in_url('No valid license found\r\nSign in to JetBrains Account: ' .. CLI_URL) == nil)
+local url = signin._sign_in_url('No valid license found\r\n\27[1mSign in to JetBrains Account: ' .. CLI_URL .. '\27[0m\r\nEnter the')
+check('cli url: complete line, escapes dropped, spaces encoded',
+  url == 'https://account.jetbrains.com/oauth/login?client_id=ide&scope=openid%20offline_access%20r_ide_auth&state=aa', url)
+
+-- The page float. Opening and copying are stubbed: no browser, no clipboard here.
+local opened, copied = {}, {}
+local orig = { open = signin._open, copy = signin._copy, remote = signin.remote, terminal = signin.terminal_login,
+  default = vim.lsp.handlers['window/showDocument'] }
+signin._open = function(u) table.insert(opened, u) return true end
+signin._copy = function(u) table.insert(copied, u) return true end
+signin.remote = function() return false end
+
+local PAGE = 'https://account.jetbrains.com/oauth/login?client_id=ide&scope=openid%20offline_access'
+local function float_text()
+  local w = vim.api.nvim_get_current_win()
+  if vim.api.nvim_win_get_config(w).relative == '' then return nil end
+  return table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(w), 0, -1, false), '\n')
+end
+local function press(key)
+  local map = vim.fn.maparg(key, 'n', false, true)
+  if map.callback then map.callback() end
+end
+
+local res = signin.show_document(nil, { uri = PAGE, external = true }, { client_id = 9301 })
+local text = float_text() or ''
+check('page: answers success so the server keeps waiting', res and res.success == true, vim.inspect(res))
+check('page: opened in the browser and copied', opened[1] == PAGE and copied[1] == PAGE, vim.inspect({ opened, copied }))
+check('page: the float shows the URL, the copy and the wait', text:find(PAGE, 1, true) and text:find('Copied to the clipboard', 1, true)
+  and text:find('Waiting for the sign-in', 1, true) and text:find('Opened the sign-in page', 1, true), text)
+local first_line = vim.api.nvim_buf_get_lines(0, -2, -1, false)[1]
+vim.wait(400, function() return vim.api.nvim_buf_get_lines(0, -2, -1, false)[1] ~= first_line end, 20)
+check('page: the spinner turns', vim.api.nvim_buf_get_lines(0, -2, -1, false)[1] ~= first_line)
+press('y')
+check('page: y copies again', #copied == 2)
+signin.close()
+check('page: close closes it', float_text() == nil)
+
+-- From a remote session the browser would open on the wrong machine.
+signin.remote = function() return true end
+opened = {}
+signin.show_document(nil, { uri = PAGE, external = true }, { client_id = 9301 })
+text = float_text() or ''
+check('page: remote -> not opened, link offered', #opened == 0 and text:find('Open this link in a browser', 1, true), text)
+signin.close()
+signin.remote = function() return false end
+
+-- Not external: Neovim's own handler.
+local delegated
+vim.lsp.handlers['window/showDocument'] = function(_, params) delegated = params return { success = true } end
+signin.show_document(nil, { uri = 'file:///tmp/A.java' }, { client_id = 9301 })
+check('page: a file goes to the default handler, no float', delegated and delegated.uri == 'file:///tmp/A.java' and float_text() == nil)
+vim.lsp.handlers['window/showDocument'] = orig.default
+
+-- With the sign-in under way: a fake server that opens the page and then waits, or replies.
+local sent = {}
+local orig_notify = vim.notify
+local notified = {}
+vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
+local function fake(id, login_reply)
+  local c = {
+    id = id,
+    server_capabilities = { experimental = { licensing = true } },
+    config = { cmd = { '/b/bin/intellij-server', '--stdio' }, cmd_env = { IJ_JAVA_OPTIONS = '-Dx=1' } },
+    is_stopped = function() return false end,
+    cancel_request = function() end,
+  }
+  c.request = function(_, method, _, handler)
+    local name = method:gsub('^jetbrains/licensing/', '')
+    table.insert(sent, { id = id, name = name })
+    if name == 'jba/login' then
+      vim.schedule(function() signin.show_document(nil, { uri = PAGE, external = true }, { client_id = id }) end)
+      -- Without a reply of its own, the sign-in waits until a sign-out ends it, as on the server.
+      if login_reply == nil then c.pending_login = handler return true, #sent end
+      vim.defer_fn(function() handler(nil, login_reply, {}) end, 50)
+    elseif name == 'jba/logout' and c.pending_login then
+      local pending = c.pending_login
+      c.pending_login = nil
+      vim.schedule(function()
+        pending(nil, { status = 'Canceled' }, {})
+        handler(nil, vim.NIL, {})
+      end)
+    else
+      vim.schedule(function() handler(nil, vim.NIL, {}) end)
+    end
+    return true, #sent
+  end
+  return c
+end
+local function names(id)
+  local out = {}
+  for _, s in ipairs(sent) do if s.id == id then table.insert(out, s.name) end end
+  return table.concat(out, ',')
+end
+local function push(id, state) licensing.handlers()[licensing.STATE](nil, state, { client_id = id }) end
+
+local finals = {}
+local orig_progress = licensing.progress
+licensing.progress = function() return function(final, status) table.insert(finals, final .. '/' .. status) return true end end
+local c = fake(9302)
+push(9302, { jbaLicensingState = { authenticationStatus = 'NotAuthenticated' }, featuresDeclined = true })
+local got
+activation.login(c, function(ok, message) got = { ok = ok, message = message } end)
+vim.wait(1000, function() return float_text() ~= nil end, 10)
+check('login: the page float is up and focused', float_text() ~= nil and activation.login_pending())
+press('<Esc>')
+vim.wait(500, function() return names(9302):find('logout') ~= nil end, 10)
+check('login: <Esc> closes the float and cancels with jba/logout', float_text() == nil and names(9302) == 'jba/login,jba/logout'
+  and not activation.login_pending(), names(9302))
+vim.wait(500, function() return #finals > 0 end, 10)
+check('login: the cancelled wait closes as Cancelled, not as still waiting', finals[1] == 'Cancelled./failed', vim.inspect(finals))
+licensing.progress = orig_progress
+
+c = fake(9303)
+activation.login(c)
+vim.wait(1000, function() return float_text() ~= nil end, 10)
+vim.cmd('close')
+vim.wait(500, function() return names(9303):find('logout') ~= nil end, 10)
+check('login: closing the float cancels too', names(9303) == 'jba/login,jba/logout', names(9303))
+
+c = fake(9304, { status = 'Licensed' })
+got = nil
+activation.login(c, function(ok, message) got = { ok = ok, message = message } end)
+vim.wait(1000, function() return got ~= nil end, 10)
+check('login: the reply closes the float without cancelling', got and got.ok and float_text() == nil
+  and names(9304) == 'jba/login', names(9304) .. ' ' .. vim.inspect(got))
+
+c = fake(9305)
+push(9305, { jbaLicensingState = { authenticationStatus = 'Authenticating' }, featuresDeclined = true })
+activation.login(c)
+vim.wait(1000, function() return float_text() ~= nil end, 10)
+licensing.reset(9305)
+vim.wait(500, function() return float_text() == nil end, 10)
+check('login: the server exiting closes the float', float_text() == nil)
+activation._reset()
+
+-- Remote: the sign-in entry is the paste-code one, run in a terminal with the server's launcher and env.
+local terminals = {}
+signin.terminal_login = function(launcher, env, opts) table.insert(terminals, { launcher = launcher, env = env, opts = opts }) end
+signin.remote = function() return true end
+local acts = activation.actions({ remote = true })
+check('remote: entry 2 pastes a code', acts[2].key == '2' and acts[2].label == 'Sign in with JetBrains Account (paste a code)'
+  and activation.ACTIONS[2].label == 'Sign in with JetBrains Account', vim.inspect(acts[2]))
+c = fake(9306)
+activation.open(c)
+check('remote: the float names the paste-code sign-in', (float_text() or ''):find('paste a code', 1, true), float_text())
+press('2')
+vim.wait(500, function() return #terminals > 0 end, 10)
+check('remote: 2 runs the CLI sign-in in a terminal, not jba/login', #terminals == 1 and terminals[1].launcher == '/b/bin/intellij-server'
+  and terminals[1].env.IJ_JAVA_OPTIONS == '-Dx=1' and names(9306) == '', vim.inspect(terminals) .. names(9306))
+signin.terminal_login, signin.remote = orig.terminal, orig.remote
+
+-- The terminal itself, against a stand-in launcher that talks like the CLI.
+local dir = vim.fn.tempname()
+vim.fn.mkdir(dir, 'p')
+local launcher = dir .. '/intellij-server'
+vim.fn.writefile({
+  '#!/bin/sh',
+  'echo "args: $*"',
+  'echo "Sign in to JetBrains Account: https://account.jetbrains.com/oauth/login?scope=openid offline_access&x=$MARK"',
+  'echo "Enter the authorization code shown after signing in:"',
+  'read code',
+  '[ "$code" = good ] && exit 0',
+  'echo "Login failed: bad code"',
+  'exit 1',
+}, launcher)
+vim.fn.setfperm(launcher, 'rwxr-xr-x')
+signin.remote = function() return false end
+opened, copied, notified = {}, {}, {}
+local function run_terminal(code)
+  local job = signin.terminal_login(launcher, vim.tbl_extend('force', vim.fn.environ(), { MARK = 'm1' }))
+  local buf = vim.api.nvim_get_current_buf()
+  vim.wait(3000, function() return #copied > 0 end, 20)
+  vim.fn.chansend(job, code .. '\n')
+  vim.fn.jobwait({ job }, 3000)
+  vim.wait(1000, function()
+    local msg = (notified[#notified] or {}).msg or ''
+    return msg:find('signed in', 1, true) or msg:find('did not complete', 1, true)
+  end, 20)
+  return buf
+end
+local buf = run_terminal('good')
+check('terminal: the paste-code CLI runs with the given env', copied[1] == 'https://account.jetbrains.com/oauth/login?scope=openid%20offline_access&x=m1',
+  vim.inspect(copied))
+check('terminal: the link opens in the local browser', opened[1] == copied[1], vim.inspect(opened))
+check('terminal: success closes the split and says so', not vim.api.nvim_buf_is_valid(buf)
+  and notified[#notified].msg:find('signed in', 1, true), vim.inspect(notified))
+opened, copied, notified = {}, {}, {}
+buf = run_terminal('bad')
+check('terminal: a failure keeps the split open', vim.api.nvim_buf_is_valid(buf)
+  and table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n'):find('args: license login --code', 1, true)
+  and notified[#notified].level == vim.log.levels.WARN, vim.inspect(notified))
+vim.cmd('stopinsert')
+pcall(vim.api.nvim_buf_delete, buf, { force = true })
+vim.fn.delete(dir, 'rf')
+
+-- :IntellijLspLicense completion
+local init = require('intellij-lsp')
+check('complete: subcommands', table.concat(init._complete_license('', 'IntellijLspLicense '), ',')
+  == 'activate,login,logout,refresh,remove,reset,server,setup,status,trial,use',
+  vim.inspect(init._complete_license('', 'IntellijLspLicense ')))
+check('complete: login takes --code', vim.deep_equal(init._complete_license('--', 'IntellijLspLicense login --'), { '--code' }))
+check('complete: nothing after --code', #init._complete_license('', 'IntellijLspLicense login --code ') == 0)
+
+signin._open, signin._copy, signin.remote = orig.open, orig.copy, orig.remote
+vim.notify = orig_notify
+for id = 9301, 9306 do licensing.reset(id) end
+activation._reset()
+signin._reset()
+end)()
+
+-- ---------------------------------------------------------------------------
+-- :IntellijLspLicense: the status float, remove, sign out, subscriptions, the CLI without a server
+-- ---------------------------------------------------------------------------
+;(function()
+local licensing = require('intellij-lsp.licensing')
+local activation = require('intellij-lsp.activation')
+local license = require('intellij-lsp.license')
+
+local function lstate(t)
+  return vim.tbl_extend('force', {
+    jbaLicensingState = { authenticationStatus = 'NotAuthenticated' },
+    licenseServerFlowState = { kind = 'notConfigured' },
+    featuresDeclined = false,
+  }, t)
+end
+local PARKED = lstate({ featuresDeclined = true, parkedReason = 'StartedUnlicensed' })
+local REMOVED = lstate({ featuresDeclined = true, parkedReason = 'LicenseRemoved' })
+local TRIAL = { source = 'trial', status = 'Valid', product = 'intellij-server', daysLeft = 30, validThrough = '2026-11-19' }
+local function sub(asset, status)
+  return { kind = 'Subscription', licensedTo = 'Ada', product = 'intellij-server', validThrough = '2027-01-31',
+    licenseId = 'L-' .. asset, assetId = asset, status = status or 'Valid' }
+end
+local ACCOUNT = { authenticationStatus = 'Authenticated', accountInfo = { displayName = 'Ada', email = 'ada@example.com' },
+  availableSubscriptions = { sub('A1'), sub('A2'), sub('A3', 'Expired') } }
+local SUBSCRIBED = lstate({ jbaLicensingState = ACCOUNT, activeLicense = { source = 'subscription', status = 'Valid',
+  product = 'intellij-server', licensedTo = 'Ada', assetId = 'A1', daysLeft = 100, validThrough = '2027-01-31' } })
+
+local sent, notified = {}, {}
+local orig_notify = vim.notify
+vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
+local function fake(id, replies, env)
+  local c = {
+    id = id,
+    server_capabilities = { experimental = { licensing = true } },
+    config = { cmd = { '/b/bin/intellij-server' }, cmd_env = env or {} },
+    is_stopped = function() return false end,
+    cancel_request = function() end,
+  }
+  c.request = function(_, method, params, handler)
+    local name = method:gsub('^jetbrains/licensing/', '')
+    table.insert(sent, { id = id, name = name, params = params })
+    local reply = replies[name]
+    vim.schedule(function()
+      if type(reply) == 'function' then reply = reply(params) end
+      handler(nil, reply, {})
+    end)
+    return true, #sent
+  end
+  return c
+end
+local function push(id, state) licensing.handlers()[licensing.STATE](nil, state, { client_id = id }) end
+local function names(id)
+  local out = {}
+  for _, s in ipairs(sent) do if s.id == id then table.insert(out, s.name) end end
+  return table.concat(out, ',')
+end
+local function result_of(fn, ...)
+  local got
+  local args = { ... }
+  table.insert(args, function(ok, message) got = { ok = ok, message = message } end)
+  fn(unpack(args))
+  vim.wait(1000, function() return got ~= nil end, 5)
+  return got or {}
+end
+local function last() return notified[#notified] or {} end
+
+-- Entries
+local function keys(view, opts) return table.concat(vim.tbl_map(function(a) return a.key end, license.status_actions(view, opts or {}))) end
+check('status: no license -> only "Activate a license"', keys(licensing.project(PARKED)) == '1'
+  and license.status_actions(licensing.project(PARKED), {})[1].label == 'Activate a license')
+check('status: a trial can be changed and removed', keys(licensing.project(lstate({ activeLicense = TRIAL }))) == '12')
+check('status: signed in -> sign out and refresh too', keys(licensing.project(SUBSCRIBED)) == '1234')
+check('status: an EAP license has no removal', keys(licensing.project(lstate({ activeLicense = { source = 'eap', status = 'Valid' } }))) == '1')
+check('status: a signed-in EAP license numbers sign out and refresh 2 and 3',
+  keys(licensing.project(lstate({ jbaLicensingState = ACCOUNT, activeLicense = { source = 'eap', status = 'Valid' } }))) == '123'
+  and license.status_actions(licensing.project(lstate({ jbaLicensingState = ACCOUNT, activeLicense = { source = 'eap', status = 'Valid' } })), {})[2].name == 'logout')
+check('status: an environment license hides remove', keys(licensing.project(lstate({ activeLicense = TRIAL })), { environment = true }) == '1')
+
+-- Lines
+local lines, first = license._status_lines(licensing.project(SUBSCRIBED), license.status_actions(licensing.project(SUBSCRIBED), {}), {})
+local text = table.concat(lines, '\n')
+check('status: the fields', lines[1] == ' License is active (JetBrains Account)'
+  and text:find(' Source         JetBrains Account', 1, true) and text:find(' Product        Java and Kotlin by IntelliJ IDEA', 1, true)
+  and text:find(' Licensed to    Ada', 1, true) and text:find(' License ID     L-A1', 1, true)
+  and text:find(' Valid through  2027-01-31 (100 days left)', 1, true) and text:find(' Account        Ada (ada@example.com)', 1, true)
+  and lines[first] == ' 1  Change license' and lines[first + 3] == ' 4  Refresh subscriptions', text)
+lines = license._status_lines(licensing.project(lstate({ activeLicense = vim.tbl_extend('force', TRIAL, { status = 'Expired', daysLeft = 1 }) })),
+  {}, { env_var = 'INTELLIJ_SERVER_LICENSE', offline = true })
+text = table.concat(lines, '\n')
+check('status: an expired license, the environment, offline', text:find(' Status         Expired', 1, true)
+  and text:find('(1 day left)', 1, true) and text:find('INTELLIJ_SERVER_LICENSE, which overrides', 1, true)
+  and text:find('No server is running', 1, true) and not text:find(' 1  ', 1, true), text)
+
+-- The float: digits act on the server.
+local c = fake(9401, {})
+push(9401, lstate({ activeLicense = TRIAL }))
+local chose = {}
+local orig = { open = activation.open, confirm = license._confirm, choose = activation.choose }
+activation.open = function(_, opts) table.insert(chose, { 'activation', opts }) end
+license._confirm = function(prompt, label, yes) table.insert(chose, { 'confirm', prompt, label }) end
+license.open_status(c, licensing.view(9401))
+check('status float: focused, titled', vim.api.nvim_win_get_config(0).relative ~= ''
+  and vim.api.nvim_win_get_config(0).title[1][1] == ' Java and Kotlin by IntelliJ IDEA · License ')
+vim.fn.maparg('1', 'n', false, true).callback()
+vim.wait(200, function() return #chose > 0 end, 5)
+check('status float: 1 opens the activation float in change mode', chose[1] and chose[1][1] == 'activation'
+  and chose[1][2].change == true, vim.inspect(chose))
+license.open_status(c, licensing.view(9401))
+vim.fn.maparg('2', 'n', false, true).callback()
+vim.wait(200, function() return #chose > 1 end, 5)
+check('status float: 2 asks before removing', chose[2] and chose[2][1] == 'confirm' and chose[2][3] == 'Remove'
+  and chose[2][2]:find('(Trial)', 1, true) and names(9401) == '', vim.inspect(chose))
+license.open_status(c, licensing.view(9401))
+check('status float: no 3 without an account', vim.fn.maparg('3', 'n') == '')
+vim.api.nvim_win_close(0, true)
+
+-- Remove, per source
+c = fake(9402, { ['activationCode/disable'] = function() push(9402, REMOVED) return vim.NIL end })
+push(9402, lstate({ activeLicense = TRIAL }))
+local r = result_of(license.remove, c)
+check('remove: a trial is disabled', r.ok and names(9402) == 'activationCode/disable'
+  and last().msg == 'IntelliJ LSP: The license was removed. Activate another license to use Java and Kotlin features.', vim.inspect(notified))
+c = fake(9403, { ['subscriptions/unuseAll'] = function()
+  push(9403, lstate({ jbaLicensingState = ACCOUNT, featuresDeclined = true, parkedReason = 'LicenseRemoved' }))
+  return vim.NIL
+end, ['jba/logout'] = function() push(9403, REMOVED) return vim.NIL end })
+push(9403, SUBSCRIBED)
+r = result_of(license.remove, c)
+check('remove: a subscription is released, then the account signed out', r.ok and names(9403) == 'subscriptions/unuseAll,jba/logout', names(9403))
+c = fake(9404, { ['licenseServer/remove'] = function() push(9404, REMOVED) return vim.NIL end })
+push(9404, lstate({ activeLicense = { source = 'licenseServer', status = 'Valid', serverAddress = 'https://fls' },
+  licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls' } }))
+r = result_of(license.remove, c)
+check('remove: a license server is removed', r.ok and names(9404) == 'licenseServer/remove', names(9404))
+c = fake(9405, { ['activationCode/disable'] = vim.NIL })
+push(9405, lstate({ activeLicense = { source = 'activationCode', status = 'Valid', licenseId = 'AC' } }))
+r = result_of(license.remove, c)
+check('remove: still licensed afterwards -> failed', not r.ok and r.message == "Couldn't remove the license. Try again."
+  and last().level == vim.log.levels.ERROR, vim.inspect(r))
+c = fake(9406, {})
+push(9406, lstate({ activeLicense = { source = 'toolbox', status = 'Valid' } }))
+r = result_of(license.remove, c)
+check('remove: a Toolbox license is not removable', not r.ok and names(9406) == ''
+  and last().msg:find("JetBrains Toolbox can't be removed", 1, true), vim.inspect(last()))
+c = fake(9407, {}, { INTELLIJ_SERVER_LICENSE = 'key' })
+push(9407, lstate({ activeLicense = TRIAL }))
+r = result_of(license.remove, c)
+check('remove: refused under an environment license', not r.ok and names(9407) == ''
+  and last().msg:find('INTELLIJ_SERVER_LICENSE', 1, true), vim.inspect(last()))
+chose = {}
+c = fake(9408, {})
+push(9408, SUBSCRIBED)
+license.confirm_remove(c)
+check('remove: removing a subscription warns about the shared sign-in', chose[1]
+  and chose[1][2]:find('signs out of the JetBrains Account', 1, true) and chose[1][2]:find('JetBrains IDEs on this machine', 1, true),
+  vim.inspect(chose))
+
+-- Sign out
+c = fake(9409, { ['jba/logout'] = function() push(9409, lstate({ activeLicense = TRIAL })) return vim.NIL end })
+push(9409, lstate({ activeLicense = TRIAL, jbaLicensingState = ACCOUNT }))
+r = result_of(license.logout, c)
+check('logout: signed out, the license stays', r.ok and names(9409) == 'jba/logout'
+  and last().msg == 'IntelliJ LSP: Signed out of the JetBrains Account.', vim.inspect(last()))
+c = fake(9410, { ['jba/logout'] = function() push(9410, REMOVED) return vim.NIL end })
+push(9410, SUBSCRIBED)
+r = result_of(license.logout, c)
+check('logout: a subscription goes with the account, and it says so', r.ok
+  and last().msg:find('Signed out of the JetBrains Account. The license was removed.', 1, true), vim.inspect(last()))
+c = fake(9411, {})
+push(9411, PARKED)
+r = result_of(license.logout, c)
+check('logout: not signed in -> nothing sent', not r.ok and names(9411) == '' and last().msg:find('Not signed in', 1, true))
+chose = {}
+c = fake(9412, {})
+push(9412, SUBSCRIBED)
+license.confirm_logout(c)
+check('logout: asks first, naming the shared sign-in', chose[1] and chose[1][3] == 'Sign out'
+  and chose[1][2]:find('Its license is removed', 1, true), vim.inspect(chose))
+
+-- Subscriptions
+c = fake(9413, { ['subscriptions/update'] = vim.NIL })
+push(9413, SUBSCRIBED)
+r = result_of(license.refresh, c)
+check('refresh: counts the valid subscriptions', r.ok and names(9413) == 'subscriptions/update'
+  and last().msg == 'IntelliJ LSP: The JetBrains Account has 2 valid subscriptions.', vim.inspect(last()))
+local offered
+activation.choose = function(opts, cb)
+  offered = vim.tbl_map(opts.format, opts.items)
+  cb(opts.items[2], 2)
+end
+c = fake(9414, { ['subscriptions/use'] = function(params)
+  local state = vim.deepcopy(SUBSCRIBED)
+  state.activeLicense.assetId = params.assetId
+  push(9414, state)
+  return vim.NIL
+end })
+push(9414, SUBSCRIBED)
+r = result_of(license.use, c)
+check('use: offers the valid ones, the active one marked', offered and #offered == 2 and offered[1]:find('(active)', 1, true)
+  and not offered[2]:find('(active)', 1, true), vim.inspect(offered))
+check('use: activates the one picked', r.ok and sent[#sent].name == 'subscriptions/use' and sent[#sent].params.assetId == 'A2', vim.inspect(sent[#sent]))
+activation.choose = function(opts, cb) cb(opts.items[2], 2) end
+local before = #sent
+r = result_of(license.use, c)
+check('use: not again for the active one', #sent == before)
+local NO_IDS = vim.deepcopy(SUBSCRIBED)
+for _, s in ipairs(NO_IDS.jbaLicensingState.availableSubscriptions) do s.licenseId = nil end
+c = fake(9416, { ['subscriptions/use'] = function(params)
+  local state = vim.deepcopy(NO_IDS)
+  state.activeLicense.assetId = params.assetId
+  push(9416, state)
+  return vim.NIL
+end })
+push(9416, NO_IDS)
+offered = nil
+activation.choose = function(opts, cb)
+  offered = vim.tbl_map(opts.format, opts.items)
+  cb(opts.items[2], 2)
+end
+r = result_of(license.use, c)
+check('use: without license ids, only the active asset is marked', offered and offered[1]:find('(active)', 1, true)
+  and not offered[2]:find('(active)', 1, true), vim.inspect(offered))
+check('use: and another one can still be picked', r.ok and sent[#sent].id == 9416 and sent[#sent].name == 'subscriptions/use'
+  and sent[#sent].params.assetId == 'A2', vim.inspect(sent[#sent]))
+c = fake(9415, {})
+push(9415, lstate({ activeLicense = TRIAL }))
+r = result_of(license.use, c)
+check('use: not signed in -> nothing offered', not r.ok and names(9415) == '' and last().msg:find('Not signed in', 1, true))
+
+-- No argument: the status float with a license, the activation float without.
+local orig_target = license.target
+chose = {}
+c = fake(9416, { ['state/get'] = PARKED })
+license.target = function() return c end
+license.open({})
+vim.wait(500, function() return #chose > 0 end, 5)
+check('no argument, no license: the activation float', chose[1] and chose[1][1] == 'activation' and chose[1][2] == nil, vim.inspect(chose))
+c = fake(9417, { ['state/get'] = lstate({ activeLicense = TRIAL }) })
+license.open({})
+vim.wait(500, function() return vim.api.nvim_win_get_config(0).relative ~= '' end, 5)
+check('no argument, a license: the status float', vim.api.nvim_win_get_config(0).relative ~= ''
+  and vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == ' License is active (Trial)' and names(9417) == 'state/get')
+vim.api.nvim_win_close(0, true)
+license.SUBCOMMANDS.remove.run({ 'extra' }, { config = {} })
+check('subcommands: unexpected arguments -> usage', notified[#notified].msg:find('usage: :IntellijLspLicense remove', 1, true))
+license.target = function() return nil end
+license.SUBCOMMANDS.logout.run({}, { config = {} })
+check('subcommands: sign out needs a running server', last().msg:find('no running server', 1, true), vim.inspect(last()))
+
+-- Without a server: the CLI, against a stand-in launcher that talks like it.
+local dir = vim.fn.tempname()
+vim.fn.mkdir(dir .. '/bin', 'p')
+local launcher = dir .. '/bin/intellij-server'
+local log = dir .. '/args'
+vim.fn.writefile({
+  '#!/bin/sh',
+  'echo "$* opts=$IJ_JAVA_OPTIONS" >> "' .. log .. '"',
+  'echo "No valid license found" >&2',
+  'case "$*" in',
+  '  "license status --json") echo \'{"jbaLicensingState":{"authenticationStatus":"NotAuthenticated"},"licenseServerFlowState":{"kind":"notConfigured"},"featuresDeclined":true,"parkedReason":"StartedUnlicensed"}\'; exit 2 ;;',
+  '  "license trial") echo "Trial started: 27 days left."; echo "License: licensed" ;;',
+  '  "license activate GOOD") echo "Activated: Ada" ;;',
+  '  "license activate"*) echo "Activation failed: Activation code rejected"; exit 1 ;;',
+  '  "license reset"*) echo "Removed the active license." ;;',
+  '  "--reset-eula") echo "Cleared the accepted-EULA record for this user and machine." ;;',
+  'esac',
+}, launcher)
+vim.fn.setfperm(launcher, 'rwxr-xr-x')
+local cfg = { server_path = launcher, jvm_args = { '-Dintellij.server.license.dir=/tmp/x' }, region = 'europe', data_sharing = 'none' }
+local function wait_notified(pattern)
+  vim.wait(5000, function() return (last().msg or ''):find(pattern, 1, true) ~= nil end, 10)
+  return (last().msg or ''):find(pattern, 1, true) ~= nil
+end
+local view, verr
+license.cli_status(cfg, function(v, e) view, verr = v or false, e end)
+vim.wait(5000, function() return view ~= nil end, 10)
+check('cli: status --json is projected (exit 2 is "not licensed")', view and view.kind == 'parked', vim.inspect(view) .. tostring(verr))
+check('cli: runs with the server environment', table.concat(vim.fn.readfile(log), '\n'):find('opts=-Dintellij.server.license.dir=/tmp/x', 1, true))
+license.SUBCOMMANDS.trial.run({}, { config = cfg })
+check('cli: trial reports the CLI result', wait_notified('Trial started: 27 days left.') and last().level == vim.log.levels.INFO, vim.inspect(last()))
+license.SUBCOMMANDS.activate.run({ 'BAD' }, { config = cfg })
+check('cli: a rejected code is an error', wait_notified('Activation failed') and last().level == vim.log.levels.ERROR, vim.inspect(last()))
+license.SUBCOMMANDS.activate.run({ 'GO', 'OD' }, { config = cfg })
+check('cli: a code pasted in pieces is joined', wait_notified('Activated: Ada'), vim.inspect(last()))
+license.SUBCOMMANDS.status.run({}, { config = cfg })
+vim.wait(5000, function() return vim.api.nvim_win_get_config(0).relative ~= '' end, 10)
+local float = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), '\n')
+check('cli: status without a server shows the store, no entries', float:find('No active license', 1, true)
+  and float:find('No server is running', 1, true) and vim.fn.maparg('1', 'n') == '', float)
+vim.api.nvim_win_close(0, true)
+check('cli: not downloaded -> says so', not license.cli({}, { 'license', 'trial' }, function() end)
+  and last().msg:find('not downloaded', 1, true))
+
+-- Reset: asks, stops the servers, then license reset, --reset-eula, and the consent store.
+local consent = require('intellij-lsp.consent')
+local orig_store = consent.store_path
+local store = dir .. '/consent.json'
+consent.store_path = function() return store end
+vim.fn.writefile({ '{"region":"europe"}' }, store)
+vim.fn.writefile({}, log)
+local stopped = 0
+license._confirm = function(prompt, label, yes) chose = { prompt, label } yes() end
+license.SUBCOMMANDS.reset.run({ '--account' }, { config = cfg, stop_all = function() stopped = stopped + 1 end })
+check('reset: reports what it removed', wait_notified('reset the license and the account sign-in, the EULA acceptance, the stored consent answers')
+  and last().level == vim.log.levels.INFO, vim.inspect(last()))
+check('reset: asked first, naming the account', chose[2] == 'Reset' and chose[1]:find('signs out of the JetBrains Account', 1, true))
+check('reset: servers stopped, CLI run in order', stopped == 1 and table.concat(vim.tbl_map(function(l) return l:match('^(.-) opts=') end,
+  vim.fn.readfile(log)), '|') == 'license reset --account|--reset-eula', vim.inspect(vim.fn.readfile(log)))
+check('reset: the consent store is gone', vim.fn.filereadable(store) == 0)
+license.SUBCOMMANDS.reset.run({ '--all' }, { config = cfg, stop_all = function() end })
+check('reset: only --account', last().msg:find('usage: :IntellijLspLicense reset [--account]', 1, true))
+
+local init = require('intellij-lsp')
+check('complete: reset takes --account', vim.deep_equal(init._complete_license('', 'IntellijLspLicense reset '), { '--account' }))
+
+consent.store_path = orig_store
+vim.fn.delete(dir, 'rf')
+license.target, license._confirm, activation.open = orig_target, orig.confirm, orig.open
+activation.choose = orig.choose
+vim.notify = orig_notify
+for id = 9401, 9417 do licensing.reset(id) end
+activation._reset()
+end)()
+
+-- ---------------------------------------------------------------------------
+-- Licensing status: statusline, notices per transition, a parked server kept quiet
+-- ---------------------------------------------------------------------------
+;(function()
+local licensing = require('intellij-lsp.licensing')
+local function lstate(t)
+  return vim.tbl_extend('force', {
+    jbaLicensingState = { authenticationStatus = 'NotAuthenticated' },
+    licenseServerFlowState = { kind = 'notConfigured' },
+    featuresDeclined = false,
+  }, t)
+end
+local function trial(days, through)
+  return { source = 'trial', status = 'Valid', product = 'intellij-server', daysLeft = days, validThrough = through or '2026-11-17' }
+end
+local NOW = 1792000000000
+local function view_of(t) return licensing.project(lstate(t)) end
+local LICENSED = view_of({ activeLicense = trial(27) })
+local GRACE = view_of({ activeLicense = { source = 'trial', status = 'Expired', product = 'intellij-server' }, graceDeadline = NOW + 12 * 60000 })
+local PARKED = view_of({ featuresDeclined = true, parkedReason = 'StartedUnlicensed' })
+local REMOVED = view_of({ featuresDeclined = true, parkedReason = 'LicenseRemoved' })
+local REVOKED = view_of({ activeLicense = { source = 'activationCode', status = 'Revoked', product = 'intellij-server' },
+  featuresDeclined = true, parkedReason = 'LicenseRevoked' })
+
+-- Statusline
+check('statusline: nothing without a state', licensing.statusline(nil) == '')
+check('statusline: quiet with more than 7 days', licensing.statusline(LICENSED) == '', licensing.statusline(LICENSED))
+check('statusline: trial counts down', licensing.statusline(view_of({ activeLicense = trial(5) })) == 'IJ trial 5d')
+check('statusline: 7 days is counted', licensing.statusline(view_of({ activeLicense = trial(7) })) == 'IJ trial 7d')
+check('statusline: other licenses count down too', licensing.statusline(view_of({ activeLicense = { source = 'activationCode',
+  status = 'Valid', product = 'intellij-server', daysLeft = 3, validThrough = '2026-10-23' } })) == 'IJ license 3d')
+check('statusline: no end date, nothing to count', licensing.statusline(view_of({ activeLicense = { source = 'eap', status = 'Valid',
+  product = 'intellij-server', daysLeft = 0 } })) == '')
+check('statusline: grace in minutes', licensing.statusline(GRACE, NOW) == 'IJ grace 12m', licensing.statusline(GRACE, NOW))
+check('statusline: long grace in hours', licensing.statusline(GRACE, NOW - 3 * 3600000) == 'IJ grace 3h',
+  licensing.statusline(GRACE, NOW - 3 * 3600000))
+check('statusline: grace past its deadline', licensing.statusline(GRACE, NOW + 3600000) == 'IJ grace 0m')
+check('statusline: parked', licensing.statusline(PARKED) == 'IJ unlicensed')
+check('statusline: unlicensed', licensing.statusline(view_of({ activeLicense = { source = 'activationCode', status = 'Invalid',
+  product = 'intellij-server' } })) == 'IJ unlicensed')
+check('statusline: session expired', licensing.statusline(view_of({ activeLicense = trial(27),
+  jbaLicensingState = { authenticationStatus = 'FailedToProlongateAuthentication', accountInfo = { displayName = 'Ada' } } })) == 'IJ sign in')
+check('statusline: signing in', licensing.statusline(view_of({ jbaLicensingState = { authenticationStatus = 'Authenticating' },
+  featuresDeclined = true })) == 'IJ signing in')
+check('license() is empty without a server', require('intellij-lsp').license() == '')
+
+-- Notices: one per transition, the first view is the baseline.
+local function run(views, own)
+  local memo, out = {}, {}
+  for i, v in ipairs(views) do
+    out[i] = licensing._notices(memo, v, own and own[i] or false) or false
+  end
+  return out
+end
+local n = run({ PARKED })
+check('notice: starting parked is the startup offer\'s', n[1] == false, vim.inspect(n))
+n = run({ LICENSED, LICENSED })
+check('notice: a licensed server says nothing', n[1] == false and n[2] == false, vim.inspect(n))
+n = run({ LICENSED, GRACE, GRACE })
+check('notice: grace started, once', n[2] and n[2].level == vim.log.levels.WARN and n[3] == false
+  and n[2].text:find('Features work until ' .. licensing.format_deadline(NOW + 12 * 60000), 1, true)
+  and n[2].text:find(':IntellijLspLicense', 1, true), vim.inspect(n))
+n = run({ GRACE })
+check('notice: a server starting in grace says so', n[1] and n[1].text:find('Features work until', 1, true), vim.inspect(n))
+n = run({ LICENSED, GRACE, view_of({ activeLicense = { source = 'trial', status = 'Expired', product = 'intellij-server' },
+  featuresDeclined = true, parkedReason = 'GraceExpired' }) })
+check('notice: parked after grace, as an error', n[3] and n[3].level == vim.log.levels.ERROR
+  and n[3].text:find('grace period has ended', 1, true) and n[3].text:find('Run :IntellijLspLicense.', 1, true), vim.inspect(n))
+n = run({ LICENSED, REVOKED })
+check('notice: license lost (revoked)', n[2] and n[2].text:find('was revoked', 1, true), vim.inspect(n))
+n = run({ LICENSED, REMOVED })
+check('notice: license removed elsewhere (CLI)', n[2] and n[2].text:find('was removed', 1, true), vim.inspect(n))
+n = run({ LICENSED, REMOVED }, { false, true })
+check('notice: a removal asked for here reports itself', n[2] == false, vim.inspect(n))
+n = run({ LICENSED, REVOKED }, { false, true })
+check('notice: a revocation is reported during a request too', n[2] ~= false, vim.inspect(n))
+n = run({ PARKED, view_of({ jbaLicensingState = { authenticationStatus = 'Authenticating' }, featuresDeclined = true }), PARKED })
+check('notice: a cancelled sign-in is not a loss', n[2] == false and n[3] == false, vim.inspect(n))
+
+-- Requests in flight count for their own client only, and a sign-in waiting on the browser not at all.
+do
+  local function silent(id)
+    return { id = id, server_capabilities = { experimental = { licensing = true } }, cancel_request = function() end,
+      request = function() return true, 1 end }
+  end
+  local orig_n, told = licensing.notify, {}
+  licensing.notify = function(notice) if notice then table.insert(told, notice.text) end end
+  licensing.request(silent(9601), 'activationCode/disable', nil, function() end)
+  licensing.request(silent(9602), 'jba/login', nil, function() end)
+  for _, id in ipairs({ 9601, 9602, 9603 }) do
+    licensing._set(id, lstate({ activeLicense = trial(27) }))
+    licensing._set(id, lstate({ featuresDeclined = true, parkedReason = 'LicenseRemoved' }))
+  end
+  check('own change: only the client with the removal in flight stays quiet', #told == 2, vim.inspect(told))
+  licensing.notify = orig_n
+  for _, id in ipairs({ 9601, 9602, 9603 }) do licensing.reset(id) end
+end
+local EXPIRED_SESSION = view_of({ activeLicense = { source = 'subscription', status = 'Valid', product = 'intellij-server', assetId = 'a' },
+  jbaLicensingState = { authenticationStatus = 'FailedToProlongateAuthentication', accountInfo = { displayName = 'Ada' } } })
+n = run({ LICENSED, EXPIRED_SESSION, EXPIRED_SESSION })
+check('notice: session expired, once', n[2] and n[2].text:find('session expired', 1, true)
+  and n[2].text:find(':IntellijLspLicense login', 1, true) and n[3] == false, vim.inspect(n))
+
+local function fls(ticket, extra)
+  return view_of(vim.tbl_extend('force', { activeLicense = { source = 'licenseServer', status = 'Valid', product = 'intellij-server',
+    serverAddress = 'https://fls.example.com' },
+    licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com', status = 'Valid', floatingTicketStatus = ticket } },
+    extra or {}))
+end
+n = run({ fls('Obtained'), fls('FailedToRefresh'), fls('Refreshing'), fls('FailedToRefresh'), fls('Obtained'), fls('FailedToRefresh') })
+check('notice: license server refresh failed, latched until obtained again', n[2] and n[2].text:find('^Lost connection')
+  and n[3] == false and n[4] == false and n[5] == false and n[6] ~= false, vim.inspect(n))
+local lost = view_of({ activeLicense = { source = 'licenseServer', status = 'Unknown', product = 'intellij-server' },
+  licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com', status = 'Unknown', floatingTicketStatus = 'NotObtained' },
+  graceDeadline = NOW })
+n = run({ fls('Obtained'), lost })
+check('notice: ticket lost and grace, in one notification', n[2] and n[2].text:find('^Lost the license from https://fls.example.com%.')
+  and n[2].text:find('Features work until', 1, true), vim.inspect(n))
+n = run({ view_of({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com', status = 'Unknown',
+  floatingTicketStatus = 'Obtaining' }, featuresDeclined = true }),
+  view_of({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com', status = 'Unknown',
+  floatingTicketStatus = 'NotObtained', errorMessage = 'No free seats' }, featuresDeclined = true }),
+  view_of({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com', status = 'Unknown',
+  floatingTicketStatus = 'NotObtained', errorMessage = 'No free seats' }, featuresDeclined = true, parkedReason = 'StartedUnlicensed' }) },
+  { false, true, false })
+check('notice: a failed licenseServer/add is the request\'s to report, and stays latched', n[2] == false and n[3] == false, vim.inspect(n))
+n = run({ fls('Obtained'), fls('Obtained', { licenseServerFlowState = { kind = 'configured', serverAddress = 'https://fls.example.com',
+  status = 'Valid', floatingTicketStatus = 'Obtained', errorMessage = 'Server restarting' } }) })
+check('notice: a license server error message on its own', n[2] and n[2].text == 'Server restarting', vim.inspect(n))
+
+-- Dedupe: the same push to every root's server shows once.
+local notified = {}
+local orig_notify = vim.notify
+vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
+licensing.notify({ text = 'unit dedupe', level = vim.log.levels.WARN })
+licensing.notify({ text = 'unit dedupe', level = vim.log.levels.WARN })
+licensing.notify(nil)
+check('notify: once per text, prefixed', #notified == 1 and notified[1].msg == 'IntelliJ LSP: unit dedupe', vim.inspect(notified))
+
+-- Through the store: two clients, one loss, one notification.
+notified = {}
+licensing._set(9501, lstate({ activeLicense = trial(27) }))
+licensing._set(9502, lstate({ activeLicense = trial(27) }))
+licensing._set(9501, lstate({ featuresDeclined = true, parkedReason = 'LicenseRevoked' }))
+licensing._set(9502, lstate({ featuresDeclined = true, parkedReason = 'LicenseRevoked' }))
+check('store: a loss pushed to two servers notifies once', #notified == 1 and notified[1].msg:find('was revoked', 1, true)
+  and notified[1].level == vim.log.levels.ERROR, vim.inspect(notified))
+licensing.reset(9501) licensing.reset(9502)
+
+-- Trial reminders: 7 days, then 1 day, at most once a day, recorded across sessions.
+local dir = vim.fn.tempname() .. '-notices'
+local orig_path = licensing.notice_path
+licensing.notice_path = function() return dir .. '/license-notices.json' end
+check('trial reminder: none above 7 days', licensing._trial_reminder(LICENSED) == nil)
+local r = licensing._trial_reminder(view_of({ activeLicense = trial(5) }))
+check('trial reminder: 5 days is the 7-day reminder', r and r.stage == 7 and r.level == vim.log.levels.INFO
+  and r.text == 'The trial ends in 5 days (valid through 2026-11-17). Run :IntellijLspLicense to activate a license.', vim.inspect(r))
+r = licensing._trial_reminder(view_of({ activeLicense = trial(1) }))
+check('trial reminder: tomorrow is the 1-day reminder', r and r.stage == 1 and r.level == vim.log.levels.WARN
+  and r.text:find('ends tomorrow', 1, true), vim.inspect(r))
+check('trial reminder: today', licensing._trial_reminder(view_of({ activeLicense = trial(0) })).text:find('ends today', 1, true))
+check('trial reminder: not for other sources', licensing._trial_reminder(view_of({ activeLicense = { source = 'activationCode',
+  status = 'Valid', product = 'intellij-server', daysLeft = 3 } })) == nil)
+
+notified = {}
+licensing.trial_notice(view_of({ activeLicense = trial(7) }), '2026-11-10')
+licensing.trial_notice(view_of({ activeLicense = trial(7) }), '2026-11-10')
+check('trial notice: shown once', #notified == 1 and notified[1].msg:find('in 7 days', 1, true), vim.inspect(notified))
+licensing.trial_notice(view_of({ activeLicense = trial(6) }), '2026-11-11')
+check('trial notice: not again the next day at the same stage', #notified == 1, vim.inspect(notified))
+licensing.trial_notice(view_of({ activeLicense = trial(1) }), '2026-11-10')
+check('trial notice: not twice on one day', #notified == 1, vim.inspect(notified))
+licensing.trial_notice(view_of({ activeLicense = trial(1) }), '2026-11-16')
+check('trial notice: the 1-day reminder', #notified == 2 and notified[2].msg:find('tomorrow', 1, true), vim.inspect(notified))
+licensing.trial_notice(view_of({ activeLicense = trial(0) }), '2026-11-17')
+check('trial notice: nothing after the 1-day reminder', #notified == 2, vim.inspect(notified))
+licensing.trial_notice(view_of({ activeLicense = trial(5, '2027-01-05') }), '2026-12-31')
+check('trial notice: a new trial reminds again', #notified == 3, vim.inspect(notified))
+vim.fn.writefile({ 'not json' }, licensing.notice_path())
+licensing.trial_notice(view_of({ activeLicense = trial(5, '2027-02-05') }), '2027-01-31')
+check('trial notice: an unreadable record reminds', #notified == 4, vim.inspect(notified))
+local no_end = view_of({ activeLicense = { source = 'trial', status = 'Valid', product = 'intellij-server', daysLeft = 5 } })
+licensing.trial_notice(no_end, '2027-03-01')
+licensing.trial_notice(no_end, '2027-03-02')
+check('trial notice: a trial without an end date reminds once per stage', #notified == 5, vim.inspect(notified))
+
+-- A parked server: ServerCancelled reads as an empty result for features, commands keep their errors.
+do
+  local replies = {}
+  local fake = {
+    id = 9510,
+    handlers = {},
+    request = function(_, method, _, handler, bufnr)
+      handler(replies[method] or { code = licensing.SERVER_CANCELLED, message = 'parked', data = vim.NIL }, nil,
+        { method = method, bufnr = bufnr })
+      return true, 1
+    end,
+  }
+  licensing.install_quiet(fake)
+  local got = {}
+  local function ask(method)
+    fake:request(method, {}, function(err, result) got[method] = { err = err, result = result } end)
+    return got[method]
+  end
+  local res = ask('textDocument/completion')
+  check('quiet: not parked, the error passes', res.err and res.err.code == licensing.SERVER_CANCELLED, vim.inspect(res))
+  check('quiet: a null error.data does not retrigger the diagnostic pull',
+    vim.deep_equal(res.err.data, { retriggerRequest = false }), vim.inspect(res.err))
+  licensing._set(9510, lstate({ featuresDeclined = true, parkedReason = 'StartedUnlicensed' }))
+  check('declined reads featuresDeclined', licensing.declined(9510) and not licensing.declined(9511))
+  for _, method in ipairs({ 'textDocument/diagnostic', 'textDocument/completion', 'codeLens/resolve',
+    'workspace/diagnostic', 'textDocument/semanticTokens/full', 'textDocument/inlayHint', 'textDocument/documentHighlight' }) do
+    res = ask(method)
+    check('quiet: parked ' .. method .. ' is empty', res.err == nil and res.result == nil, vim.inspect(res))
+  end
+  -- Asked for on purpose: an empty result would read as done or nothing found.
+  for _, method in ipairs({ 'workspace/executeCommand', 'intellij/reloadWorkspace', 'workspace/willRenameFiles',
+    'textDocument/formatting', 'textDocument/rename', 'workspace/symbol', 'callHierarchy/incomingCalls' }) do
+    res = ask(method)
+    check('quiet: parked ' .. method .. ' keeps its error, saying why', res.err and res.err.code == licensing.SERVER_CANCELLED
+      and res.err.message == 'No active license. Activate a license to use Java and Kotlin features. Run :IntellijLspLicense.',
+      vim.inspect(res))
+  end
+
+  -- Neovim drops the errors of these, so they would say "nothing found": a prompt instead, and no
+  -- handler call while this is the only server that answers the method.
+  local orig_get_clients = vim.lsp.get_clients
+  local others = {}
+  vim.lsp.get_clients = function() return others end
+  notified = {}
+  got['textDocument/references'] = nil
+  fake:request('textDocument/references', {}, function(err, result)
+    got['textDocument/references'] = { err = err, result = result }
+  end)
+  check('quiet: parked references does not say "nothing found"', got['textDocument/references'] == nil,
+    vim.inspect(got['textDocument/references']))
+  vim.wait(200, function() return #notified > 0 end, 10)
+  check('quiet: parked references names the feature and the cause', #notified == 1 and notified[1].level == vim.log.levels.WARN
+    and notified[1].msg == 'IntelliJ LSP: Find References needs an active license. No active license. Activate a license'
+      .. ' to use Java and Kotlin features. Run :IntellijLspLicense.', vim.inspect(notified))
+  fake:request('textDocument/definition', {}, function() end)
+  vim.wait(50, function() return false end, 10)
+  check('quiet: one prompt for requests moments apart', #notified == 1, vim.inspect(notified))
+  others = { { id = 9520 } }
+  res = nil
+  fake:request('textDocument/hover', {}, function(err, result) res = { err = err, result = result } end, 1)
+  check('quiet: with another server in the buffer, its answer still shows', res and res.err == nil and res.result == nil,
+    vim.inspect(res))
+  others = {}
+  local sync = require('vim.lsp.client').request_sync(fake, 'textDocument/definition', {}, 5000)
+  check('quiet: a synchronous caller (tagfunc) is not held up, and gets the error', sync and sync.err
+    and sync.err.message:find(':IntellijLspLicense', 1, true), vim.inspect(sync))
+  vim.lsp.get_clients = orig_get_clients
+
+  res = ask('textDocument/codeAction')
+  check('quiet: parked code actions offer to activate a license', res.err == nil
+    and vim.deep_equal(res.result, { licensing.ACTIVATE_ACTION }), vim.inspect(res))
+  check('quiet: the activate command is the client\'s', type(fake.commands[licensing.ACTIVATE_COMMAND]) == 'function')
+  replies['textDocument/hover'] = { code = -32603, message = 'boom' }
+  res = ask('textDocument/hover')
+  check('quiet: other errors pass while parked', res.err and res.err.code == -32603, vim.inspect(res))
+  fake.handlers['textDocument/documentHighlight'] = function(err, result) got.default = { err = err, result = result } end
+  fake:request('textDocument/documentHighlight', {})
+  check('quiet: a handler resolved from the client is wrapped too', got.default and got.default.err == nil, vim.inspect(got.default))
+
+  -- The code action's command opens the prompt for the client that offered it.
+  local orig_get_by_id = vim.lsp.get_client_by_id
+  vim.lsp.get_client_by_id = function(id) return id == 9510 and fake or orig_get_by_id(id) end
+  local dedupe = licensing.PROMPT_DEDUPE_MS
+  licensing.PROMPT_DEDUPE_MS = 0
+  notified = {}
+  fake.commands[licensing.ACTIVATE_COMMAND]({ command = licensing.ACTIVATE_COMMAND }, { client_id = 9510 })
+  vim.wait(200, function() return #notified > 0 end, 10)
+  licensing.PROMPT_DEDUPE_MS = dedupe
+  check('activate command: prompts for code actions', notified[1] and notified[1].msg:find('Code actions needs an active license', 1, true),
+    vim.inspect(notified))
+  vim.lsp.get_client_by_id = orig_get_by_id
+
+  -- The hint above the first line, while the buffer's server is parked.
+  local hbuf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(hbuf, 0, -1, false, { 'class A {}' })
+  local orig_clients = vim.lsp.get_clients
+  local attached = { fake }
+  vim.lsp.get_clients = function() return attached end
+  licensing.show_hint(hbuf)
+  local marks = vim.api.nvim_buf_get_extmarks(hbuf, licensing.HINT_NS, 0, -1, { details = true })
+  check('hint: shown at the end of the first line while parked', #marks == 1 and marks[1][2] == 0
+    and marks[1][4].virt_text_pos == 'eol' and marks[1][4].virt_text[1][1] == licensing.HINT, vim.inspect(marks))
+  licensing.show_hint(hbuf)
+  check('hint: shown once', #vim.api.nvim_buf_get_extmarks(hbuf, licensing.HINT_NS, 0, -1, {}) == 1)
+  attached = {}
+  licensing.show_hint(hbuf)
+  check('hint: cleared without a parked server', #vim.api.nvim_buf_get_extmarks(hbuf, licensing.HINT_NS, 0, -1, {}) == 0)
+  attached = { fake }
+  licensing.install_hints()
+  licensing._set(9510, lstate({ featuresDeclined = true, parkedReason = 'GraceExpired' }))
+  check('hint: follows a license change', #vim.api.nvim_buf_get_extmarks(hbuf, licensing.HINT_NS, 0, -1, {}) == 1)
+  licensing._set(9510, lstate({ activeLicense = trial(27) }))
+  check('hint: gone once licensed', #vim.api.nvim_buf_get_extmarks(hbuf, licensing.HINT_NS, 0, -1, {}) == 0)
+  -- Let the refresh that licensing schedules run now, while the client is unknown, not in the checks below.
+  vim.wait(50, function() return false end, 10)
+  licensing._set(9510, lstate({ featuresDeclined = true, parkedReason = 'StartedUnlicensed' }))
+  vim.lsp.get_clients = orig_clients
+  vim.api.nvim_buf_delete(hbuf, { force = true })
+
+  -- After activation: lenses and hints are asked for again, once features come back.
+  local refreshed = {}
+  local orig_handlers, orig_get = {}, vim.lsp.get_client_by_id
+  for _, m in ipairs({ 'workspace/diagnostic/refresh', 'workspace/semanticTokens/refresh', 'workspace/codeLens/refresh',
+    'workspace/inlayHint/refresh' }) do
+    orig_handlers[m] = vim.lsp.handlers[m]
+    vim.lsp.handlers[m] = function(_, _, ctx) table.insert(refreshed, m .. '@' .. ctx.client_id) end
+  end
+  vim.lsp.get_client_by_id = function(id) return id == 9510 and fake or orig_get(id) end
+  licensing._set(9510, lstate({ featuresDeclined = true, parkedReason = 'StartedUnlicensed', jbaLicensingState = { authenticationStatus = 'Authenticating' } }))
+  vim.wait(50, function() return false end, 10)
+  check('refresh: nothing while still parked', #refreshed == 0, vim.inspect(refreshed))
+  licensing._set(9510, lstate({ activeLicense = trial(27) }))
+  vim.wait(500, function() return #refreshed == 4 end, 10)
+  check('refresh: diagnostics, tokens, lenses and hints once licensed', vim.deep_equal(refreshed,
+    { 'workspace/diagnostic/refresh@9510', 'workspace/semanticTokens/refresh@9510', 'workspace/codeLens/refresh@9510',
+      'workspace/inlayHint/refresh@9510' }), vim.inspect(refreshed))
+  licensing._set(9510, lstate({ activeLicense = trial(26) }))
+  vim.wait(50, function() return false end, 10)
+  check('refresh: not on every licensed push', #refreshed == 4, vim.inspect(refreshed))
+  res = ask('textDocument/completion')
+  check('quiet: licensed again, errors pass', res.err ~= nil, vim.inspect(res))
+  res = ask('textDocument/references')
+  check('quiet: licensed again, references get their error', res.err ~= nil, vim.inspect(res))
+  for m, h in pairs(orig_handlers) do vim.lsp.handlers[m] = h end
+  vim.lsp.get_client_by_id = orig_get
+  licensing.reset(9510)
+end
+
+vim.notify = orig_notify
+licensing.notice_path = orig_path
+vim.fn.delete(dir, 'rf')
+end)()
+
+-- ---------------------------------------------------------------------------
+-- :checkhealth: the license of a running server, and the consent it was launched with
+-- ---------------------------------------------------------------------------
+;(function()
+local health = require('intellij-lsp.health')
+local licensing = require('intellij-lsp.licensing')
+local function view_of(t)
+  return licensing.project(vim.tbl_extend('force', {
+    jbaLicensingState = { authenticationStatus = 'NotAuthenticated' },
+    licenseServerFlowState = { kind = 'notConfigured' },
+    featuresDeclined = false,
+  }, t))
+end
+local function levels(report) return table.concat(vim.tbl_map(function(i) return i.level end, report), ',') end
+local ENV = { INTELLIJ_REGION = 'europe' }
+
+local r = health._license_report(view_of({ activeLicense = {
+  source = 'trial', status = 'Valid', product = 'intellij-server', daysLeft = 27, validThrough = '2026-11-17' } }), ENV)
+check('health: licensed is ok, then the launch consent', levels(r) == 'ok,info', vim.inspect(r))
+check('health: source, status and days left',
+  r[1].text == '  license: License is active (Trial) [source Trial, status Valid, valid through 2026-11-17 (27 days left)]',
+  r[1].text)
+check('health: region and data sharing from the environment, none when absent',
+  r[2].text == '  launched with region europe, data sharing none', r[2].text)
+
+r = health._license_report(view_of({ featuresDeclined = true, parkedReason = 'StartedUnlicensed' }),
+  { INTELLIJ_REGION = 'apac', INTELLIJ_DATA_SHARING = 'anonymous' })
+check('health: parked is an error naming the reason', r[1].level == 'error'
+  and r[1].text:find('[parked: StartedUnlicensed]', 1, true) ~= nil, vim.inspect(r[1]))
+check('health: parked advice names the command',
+  vim.iter(r[1].advice):any(function(a) return a:find(':IntellijLspLicense', 1, true) ~= nil end), vim.inspect(r[1].advice))
+check('health: data sharing as launched', r[2].text == '  launched with region apac, data sharing anonymous', r[2].text)
+
+r = health._license_report(view_of({ featuresDeclined = true, parkedReason = 'LicenseRevoked', activeLicense = {
+  source = 'activationCode', status = 'Revoked', product = 'intellij-server' } }), ENV)
+check('health: a revoked license shows its source and status',
+  r[1].text:find('source Activation Code, status Revoked, parked: LicenseRevoked', 1, true) ~= nil, r[1].text)
+
+r = health._license_report(view_of({ activeLicense = {
+  source = 'subscription', status = 'Valid', product = 'intellij-server', daysLeft = 200, validThrough = '2027-05-01' },
+  jbaLicensingState = { authenticationStatus = 'FailedToProlongateAuthentication', accountInfo = { displayName = 'A' } } }), ENV)
+check('health: session expired warns with login', r[1].level == 'warn' and r[1].advice[1]:find('login', 1, true) ~= nil,
+  vim.inspect(r[1]))
+
+r = health._license_report(view_of({ activeLicense = { source = 'trial', status = 'Expired', product = 'intellij-server' },
+  graceDeadline = 1792000000000 }), ENV)
+check('health: grace warns', r[1].level == 'warn' and r[1].text:find('Features work until', 1, true) ~= nil, r[1].text)
+
+r = health._license_report(view_of({ licenseServerFlowState = { kind = 'configured', serverAddress = 'https://ls.example',
+  floatingTicketStatus = 'FailedToRefresh' }, featuresDeclined = true, parkedReason = 'GraceExpired' }), ENV)
+check('health: a license server failure gets its own line', levels(r) == 'error,warn,info'
+  and r[2].text:find('license server', 1, true) ~= nil, vim.inspect(r))
+
+r = health._license_report(view_of({ activeLicense = {
+  source = 'licenseServer', status = 'Valid', product = 'intellij-server', serverAddress = 'https://ls.example' } }),
+  { JETBRAINS_LICENSE_SERVER = 'https://ls.example', INTELLIJ_REGION = 'europe' })
+check('health: an environment license is named', r[2].level == 'info'
+  and r[2].text:find('JETBRAINS_LICENSE_SERVER', 1, true) ~= nil, vim.inspect(r))
+
+r = health._license_report(false, ENV)
+check('health: a server without the protocol says so', levels(r) == 'info,info'
+  and r[1].text:find('does not report', 1, true) ~= nil, vim.inspect(r))
+r = health._license_report(nil, nil)
+check('health: unreadable state warns, no consent line without an env', levels(r) == 'warn', vim.inspect(r))
+end)()
+
+-- ---------------------------------------------------------------------------
+-- Every licensing float: centred, one width, the product in the title
+-- ---------------------------------------------------------------------------
+;(function()
+local activation = require('intellij-lsp.activation')
+local consent = require('intellij-lsp.consent')
+local license = require('intellij-lsp.license')
+local signin = require('intellij-lsp.signin')
+local function shape(win)
+  local cfg = vim.api.nvim_win_get_config(win)
+  return { width = cfg.width, col = cfg.col, row = cfg.row, height = cfg.height, title = cfg.title and cfg.title[1][1] or '' }
+end
+local function centred(sh)
+  return sh.width == activation.width() and math.abs((vim.o.columns - sh.width) / 2 - sh.col) <= 1
+    and math.abs((vim.o.lines - sh.height) / 2 - 1 - sh.row) <= 1
+end
+local floats = {}
+local function grab(name)
+  local win = vim.api.nvim_get_current_win()
+  floats[name] = shape(win)
+  return win
+end
+
+-- Remove: the whole question in the float, not cut into the title.
+local said
+license._confirm('Remove the license (Trial)? Java and Kotlin features stop until another license is active.', 'Remove',
+  function() said = 'yes' end)
+local win = grab('confirm')
+local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false), '\n')
+check('confirm: the question in full, then Remove and Cancel', text:find('Remove the license (Trial)?', 1, true)
+  and text:find(' 1  Remove', 1, true) and text:find(' 2  Cancel', 1, true), text)
+check('confirm: titled with the product', floats.confirm.title == ' Java and Kotlin by IntelliJ IDEA · License ',
+  floats.confirm.title)
+vim.api.nvim_feedkeys('1', 'x', false)
+vim.wait(500, function() return said ~= nil end, 10)
+check('confirm: 1 runs it', said == 'yes')
+
+activation.choose({ text = { 'Pick one' }, items = { 'a', 'b' } }, function() end)
+vim.api.nvim_win_close(grab('choose'), true)
+activation._open_input({ title = 'License server URL', single = true, lines = { 'https://' } }, function() end)
+win = grab('url')
+check('url input: one line, titled', floats.url.height == 1
+  and floats.url.title == ' Java and Kotlin by IntelliJ IDEA · License server URL ', vim.inspect(floats.url))
+vim.api.nvim_win_close(win, true)
+vim.cmd('stopinsert')
+activation._open_input({ title = 'Activation code' }, function() end)
+vim.api.nvim_win_close(grab('code'), true)
+vim.cmd('stopinsert')
+consent._choose('region', 1, 3, function() end)
+vim.api.nvim_win_close(grab('setup'), true)
+consent._open_eula('terms', function() end, { index = 2, total = 3 })
+vim.api.nvim_win_close(grab('eula'), true)
+local orig_open, orig_copy = signin._open, signin._copy
+signin._open, signin._copy = function() return true end, function() return false end
+signin.show_page('https://account.jetbrains.com/x', 9701)
+grab('signin')
+signin.close()
+signin._open, signin._copy = orig_open, orig_copy
+local off = {}
+for name, sh in pairs(floats) do
+  -- The EULA fills the height on purpose; only its width and column count.
+  local ok = name == 'eula' and sh.width == activation.width() or centred(sh)
+  if not ok then off[name] = sh end
+end
+check('every licensing float is centred at one width', vim.tbl_isempty(off) and vim.tbl_count(floats) == 7, vim.inspect(off))
+for name, sh in pairs(floats) do
+  if not sh.title:find('Java and Kotlin by IntelliJ IDEA', 1, true) then off[name] = sh.title end
+end
+check('every licensing float names the product', vim.tbl_isempty(off), vim.inspect(off))
+end)()
 
 print(failures == 0 and '\nALL UNIT CHECKS PASSED' or ('\n' .. failures .. ' UNIT CHECK(S) FAILED'))
 vim.cmd(failures == 0 and 'qa!' or 'cq!')
