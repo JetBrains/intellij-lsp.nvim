@@ -239,6 +239,7 @@ end
 --- @param rev string|nil defaults to the index
 function M.open(rev)
   local bufnr = vim.api.nvim_get_current_buf()
+  local origin_win = vim.api.nvim_get_current_win()
   local root = cmd.root()
   if not root then
     vim.notify('IntelliJ git: not inside a git repository.', vim.log.levels.WARN)
@@ -268,6 +269,19 @@ function M.open(rev)
     -- Guard against the buffer having gone away while git ran.
     if not vim.api.nvim_buf_is_valid(bufnr) then return end
 
+    -- The pane the diff belongs in is wherever the file is shown, not the window that is current now:
+    -- the user may have moved on while git ran, and diffing this revision against whatever buffer is
+    -- current would let a hunk transfer edit an unrelated file.
+    local work_win = origin_win
+    if not (vim.api.nvim_win_is_valid(work_win) and vim.api.nvim_win_get_buf(work_win) == bufnr) then
+      work_win = vim.tbl_filter(function(w) return vim.api.nvim_win_get_buf(w) == bufnr end,
+        vim.api.nvim_tabpage_list_wins(0))[1]
+    end
+    if not work_win then
+      vim.notify('IntelliJ git: the file is no longer shown; diff not opened.', vim.log.levels.WARN)
+      return
+    end
+
     local lines = vim.split(res.stdout, '\n', { plain = true })
     -- git's output ends with a newline, which would otherwise show as a spurious trailing blank line
     -- and register as a difference against a file that has none.
@@ -285,9 +299,9 @@ function M.open(rev)
     require('intellij-lsp.git.session').set_scratch_filetype(scratch, vim.bo[bufnr].filetype)
     vim.api.nvim_buf_set_name(scratch, ('intellij-git://%s/%s'):format(label, rel))
 
-    -- The working-tree pane is the current window, so diff mode is entered there first and the
-    -- revision opens to its left -- older on the left, matching every other diff tool.
-    local work_win = vim.api.nvim_get_current_win()
+    -- Diff mode is entered in the working-tree pane first and the revision opens to its left -- older
+    -- on the left, matching every other diff tool.
+    vim.api.nvim_set_current_win(work_win)
     vim.cmd('diffthis')
     vim.cmd('leftabove vsplit')
     local win = vim.api.nvim_get_current_win()

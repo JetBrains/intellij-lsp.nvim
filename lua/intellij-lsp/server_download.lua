@@ -13,6 +13,10 @@
 --- A lock directory guards against two Neovim instances installing the same version at once. It
 --- records the owner's PID, so a lock left behind by a killed editor is detected and removed
 --- instead of stalling the next start.
+---
+--- The bundle is extracted next to its version directory and renamed into place once it checks out,
+--- so the launcher existing means the whole bundle does: another instance waiting on the lock never
+--- sees a half-extracted one, and an extraction cut short leaves nothing that reads as installed.
 
 local bundles = require('intellij-lsp.server_bundles')
 
@@ -329,20 +333,30 @@ local function install(bundle, kind, version_dir, launcher, done)
       end
 
       line.update(('Extracting intellij-server %s'):format(bundle.version), 100)
-      extract(archive_path, kind, version_dir, function(ok, err)
+      -- Whatever is already there is the remains of an install that died while extracting.
+      local staging = version_dir .. '.partial'
+      vim.fn.delete(staging, 'rf')
+      extract(archive_path, kind, staging, function(ok, err)
         vim.fn.delete(archive_path)
-        if not ok then
+        local staged_launcher = launcher_path(staging)
+        if ok and vim.fn.filereadable(staged_launcher) ~= 1 then
+          ok, err = false, 'extracted bundle has no launcher at ' .. launcher
+        end
+        if ok then
+          if vim.fn.has('win32') ~= 1 then
+            vim.fn.setfperm(staged_launcher, 'rwxr-xr-x')
+          end
+          -- No launcher there, or this install would not be running: nothing worth keeping.
           vim.fn.delete(version_dir, 'rf')
+          local renamed, rename_err = vim.uv.fs_rename(staging, version_dir)
+          if not renamed then
+            ok, err = false, 'could not move the extracted bundle into place: ' .. tostring(rename_err)
+          end
+        end
+        if not ok then
+          vim.fn.delete(staging, 'rf')
           finish(nil, err)
           return
-        end
-        if vim.fn.filereadable(launcher) ~= 1 then
-          vim.fn.delete(version_dir, 'rf')
-          finish(nil, 'extracted bundle has no launcher at ' .. launcher)
-          return
-        end
-        if vim.fn.has('win32') ~= 1 then
-          vim.fn.setfperm(launcher, 'rwxr-xr-x')
         end
         finish(launcher, nil)
       end)

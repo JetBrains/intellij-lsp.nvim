@@ -653,7 +653,18 @@ end
 --- own view of the tree, not the program's) and watch expressions (only their values go stale).
 --- Re-renders through the normal path rather than a separate "cleared" view -- see README "A resume
 --- must not blank the watch list".
-local function on_continued()
+--- Whether an event concerns the session the panel follows: one of this plugin's, and once the panel
+--- shows a stop, that very session.
+--- @param session dap.Session|nil
+--- @return boolean
+local function followed(session)
+  if not require('intellij-lsp.run').owns(session) then return false end
+  return not (panel and panel.session) or panel.session == session
+end
+
+--- @param session dap.Session
+local function on_continued(session)
+  if not followed(session) then return end
   generation = generation + 1
   clear_frame_preview()
   if not panel then return end
@@ -695,6 +706,7 @@ end
 --- @param session dap.Session
 --- @param body dap.StoppedEvent the just-received event, read for `threadId` directly
 local function on_stopped(session, body)
+  if not require('intellij-lsp.run').owns(session) then return end
   generation = generation + 1
   ensure_panel()
   panel.session = session
@@ -717,7 +729,9 @@ local function on_stopped(session, body)
   end)
 end
 
-local function on_invalidated()
+--- @param session dap.Session
+local function on_invalidated(session)
+  if not followed(session) then return end
   -- The one case the server sends this for: a value served as a placeholder (`Collecting data…`)
   -- settled asynchronously. Discard cached children and re-fetch everything visible.
   if not panel or not panel.frame then return end

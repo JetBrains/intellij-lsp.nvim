@@ -311,6 +311,50 @@ vim.cmd('silent! only')
 diff.open('definitely-not-a-ref')
 check('bad revision does not crash', true)
 
+-- Moving on while git runs: the diff goes where the file is, never against whatever is current.
+do
+  local function diffed()
+    return vim.tbl_filter(function(w) return vim.wo[w].diff end, vim.api.nvim_tabpage_list_wins(0))
+  end
+  local function revision_panes()
+    return vim.tbl_filter(function(w)
+      return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w)):find('^intellij%-git://') ~= nil
+    end, vim.api.nvim_tabpage_list_wins(0))
+  end
+
+  vim.cmd('silent! only')
+  vim.cmd.edit(repo .. '/tracked.txt')
+  local file_buf = vim.api.nvim_get_current_buf()
+  vim.cmd('rightbelow vsplit ' .. vim.fn.fnameescape(repo .. '/elsewhere.txt'))
+  local other_win, other_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+  vim.cmd('wincmd p')
+  local file_win = vim.api.nvim_get_current_win()
+  diff.open()
+  vim.api.nvim_set_current_win(other_win)
+  wait_for(function() return #revision_panes() == 1 end, 'the diff after switching windows')
+  check('switched window: the diff opens beside the file it was asked for',
+    vim.wo[file_win].diff and vim.api.nvim_win_get_buf(file_win) == file_buf)
+  check('switched window: the other window is left out of it', not vim.wo[other_win].diff
+    and vim.api.nvim_win_get_buf(other_win) == other_buf)
+  for _, w in ipairs(revision_panes()) do vim.api.nvim_win_close(w, true) end
+
+  -- The file is shown nowhere any more: nothing to diff against, so nothing opens.
+  vim.cmd('silent! only')
+  vim.cmd('diffoff!')
+  vim.cmd.edit(repo .. '/tracked.txt')
+  local notified
+  local real_notify = vim.notify
+  vim.notify = function(msg) notified = msg end
+  diff.open()
+  vim.cmd.edit(repo .. '/elsewhere.txt')
+  wait_for(function() return notified ~= nil end, 'the abandoned diff')
+  vim.notify = real_notify
+  check('switched buffer: no revision pane opens', #revision_panes() == 0)
+  check('switched buffer: the buffer now shown is not diffed', #diffed() == 0)
+  check('switched buffer: says why', notified and notified:find('no longer shown', 1, true), tostring(notified))
+  vim.cmd('silent! only')
+end
+
 -- -------------------------------------------------------------------------------------------------
 -- In-progress detection: read from disk, so it survives a restart
 -- -------------------------------------------------------------------------------------------------

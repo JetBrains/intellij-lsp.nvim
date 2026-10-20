@@ -116,6 +116,9 @@ local M = {}
 --- @type IntellijLspConfig
 M.config = {}
 
+--- How many `stop_all` calls are waiting for their servers to exit. No server starts meanwhile.
+local stopping = 0
+
 local function expand(path)
   return path and vim.fn.expand(path) or nil
 end
@@ -130,6 +133,9 @@ end
 --- @param bufnr integer
 local function start_for_buffer(bufnr)
   if vim.b[bufnr].intellij_lsp_attached then return end
+  -- A server started now would claim the cache directory the stopping one still holds. The restart
+  -- attaches every loaded buffer once that one has exited.
+  if stopping > 0 then return end
 
   local name = vim.api.nvim_buf_get_name(bufnr)
 
@@ -217,6 +223,7 @@ M._is_shared_dir = is_shared_dir
 M._start_for_buffer = start_for_buffer
 
 local function start_eagerly()
+  if stopping > 0 then return end
   -- Global rather than per-directory on purpose: a `:cd` into another project mid-session is not a
   -- request to import it. `:IntellijLspRestart` is the escape hatch.
   if vim.g.intellij_lsp_eager_started then return end
@@ -245,11 +252,27 @@ local function start_eagerly()
   end)
 end
 
---- Stops every server started by this plugin.
---- @return string|nil index_dir reported by the stopped client, if any
-local function stop_all()
+--- How long a server gets to shut down before `stop_all` sends it SIGTERM, then how long it gets to
+--- exit after that, in milliseconds.
+M.STOP_TIMEOUT = 10000
+M.KILL_TIMEOUT = 5000
+
+--- Stops every server started by this plugin, and calls `done` once all of them have exited.
+---
+--- Exited, not asked to stop. The server holds a lock on its cache directory until it is gone, so
+--- deleting the index or starting a replacement before then breaks the live one, and its exit
+--- callback releases the directory's claim -- by then the replacement's, since both are this Neovim's.
+--- `is_stopped()` is no help, being true from the moment `stop()` is called; a client leaves
+--- `get_client_by_id` only after its process has exited and its exit callbacks have run.
+---
+--- Initializing clients are included: a server stuck in `initialize` is what a restart is for. One
+--- still running after `M.STOP_TIMEOUT` gets SIGTERM; one that survives that too is reported, and
+--- `done` is not called. Until then no server starts, see `start_for_buffer`.
+--- @param done fun(index_dir: string|nil) given the index directory reported by a stopped client, if any
+local function stop_all(done)
   local index_dir
-  for _, c in ipairs(vim.lsp.get_clients({ name = client.NAME })) do
+  local clients = vim.lsp.get_clients({ name = client.NAME, _uninitialized = true })
+  for _, c in ipairs(clients) do
     index_dir = index_dir or c.config.index_dir
     progress.reset(c.id)
     require('intellij-lsp.status').reset(c.id)
@@ -261,14 +284,40 @@ local function stop_all()
   if package.loaded['intellij-lsp.decompiler'] then
     require('intellij-lsp.decompiler').reset()
   end
-  return index_dir
+
+  stopping = stopping + 1
+  local waited, forced = 0, false
+  local timer = assert(vim.uv.new_timer())
+  timer:start(0, 50, vim.schedule_wrap(function()
+    if timer:is_closing() then return end
+    local running = vim.tbl_filter(function(c) return vim.lsp.get_client_by_id(c.id) ~= nil end, clients)
+    local gave_up = forced and waited >= M.STOP_TIMEOUT + M.KILL_TIMEOUT
+    if #running > 0 and not gave_up then
+      if not forced and waited >= M.STOP_TIMEOUT then
+        forced = true
+        for _, c in ipairs(running) do c:stop(true) end
+      end
+      waited = waited + 50
+      return
+    end
+    timer:stop()
+    timer:close()
+    stopping = stopping - 1
+    if #running > 0 then
+      vim.notify('IntelliJ LSP: the server did not exit, even after SIGTERM. Nothing was restarted or cleared.',
+        vim.log.levels.ERROR)
+      return
+    end
+    done(index_dir)
+  end))
 end
 
 --- Clears the attach guards so the next pass re-attaches.
 ---
---- Called only from the restart paths, right after `stop_all`, which is what makes clearing the eager
---- guard safe here: the client it was guarding is gone. Doing it in `attach_loaded_buffers` instead
---- would clear it on the `setup()` path too, where the eager start may legitimately have run already.
+--- Called only from the restart paths, once `stop_all` has seen every server exit, which is what
+--- makes clearing the eager guard safe here: the client it was guarding is gone. Doing it in
+--- `attach_loaded_buffers` instead would clear it on the `setup()` path too, where the eager start
+--- may legitimately have run already.
 local function clear_attach_flags()
   vim.g.intellij_lsp_eager_started = nil
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
@@ -297,10 +346,10 @@ local function attach_loaded_buffers()
 end
 
 function M.restart()
-  stop_all()
-  clear_attach_flags()
-  -- Give the old process time to release its lock on the index before restarting.
-  vim.defer_fn(attach_loaded_buffers, 500)
+  stop_all(function()
+    clear_attach_flags()
+    attach_loaded_buffers()
+  end)
 end
 
 --- Stops the server, deletes its index directory, and starts again.
@@ -308,19 +357,18 @@ end
 --- Deletion happens while the server is down: RocksDB holds a lock on the index directory, so
 --- clearing it under a live server would corrupt the index.
 function M.clear_cache()
-  local index_dir = stop_all()
-  clear_attach_flags()
+  stop_all(function(index_dir)
+    clear_attach_flags()
 
-  if not index_dir then
-    vim.notify(
-      'IntelliJ LSP: no index directory reported; restarting without clearing.',
-      vim.log.levels.WARN
-    )
-    vim.defer_fn(attach_loaded_buffers, 500)
-    return
-  end
+    if not index_dir then
+      vim.notify(
+        'IntelliJ LSP: no index directory reported; restarting without clearing.',
+        vim.log.levels.WARN
+      )
+      attach_loaded_buffers()
+      return
+    end
 
-  vim.defer_fn(function()
     local ok, err = pcall(vim.fn.delete, index_dir, 'rf')
     if ok then
       vim.notify('IntelliJ LSP: cleared ' .. index_dir, vim.log.levels.INFO)
@@ -328,7 +376,7 @@ function M.clear_cache()
       vim.notify('IntelliJ LSP: failed to clear index: ' .. tostring(err), vim.log.levels.ERROR)
     end
     attach_loaded_buffers()
-  end, 500)
+  end)
 end
 
 --- Deletes a corrupted downloaded bundle, downloads it again and starts the servers on it.
@@ -336,10 +384,9 @@ end
 --- The servers are stopped first because they run from the directory being deleted. The version
 --- directory is the bundle root itself: `server_download` extracts each version into its own.
 function M.reinstall()
-  stop_all()
-  clear_attach_flags()
   local root = require('intellij-lsp.launch').server_root(M.config.server_path)
-  vim.defer_fn(function()
+  stop_all(function()
+    clear_attach_flags()
     vim.fn.delete(root, 'rf')
     require('intellij-lsp.server_download').ensure(function(path, err)
       if not path then
@@ -349,7 +396,7 @@ function M.reinstall()
       M.config.server_path = path
       attach_loaded_buffers()
     end)
-  end, 500)
+  end)
 end
 
 --- `:IntellijLspLicense setup`: asks region, EULA and data sharing again.
@@ -490,6 +537,12 @@ function M.rename_file(new_path)
     return
   end
   new_path = vim.fn.fnamemodify(vim.fn.expand(new_path), ':p')
+  -- Checked before asking the server: once its reference edits are applied, refusing the move would
+  -- leave them pointing at a file that was never renamed.
+  if vim.uv.fs_stat(new_path) then
+    vim.notify('IntelliJ LSP: ' .. new_path .. ' already exists.', vim.log.levels.ERROR)
+    return
+  end
 
   c:request('workspace/willRenameFiles', {
     files = { { oldUri = vim.uri_from_fname(old_path), newUri = vim.uri_from_fname(new_path) } },
@@ -514,16 +567,17 @@ function M.rename_file(new_path)
         end
       end
 
-      vim.fn.mkdir(vim.fs.dirname(new_path), 'p')
-      local moved, move_err = pcall(vim.fn.rename, old_path, new_path)
-      if not moved or move_err ~= 0 then
-        vim.notify('IntelliJ LSP: references updated but the move failed.', vim.log.levels.ERROR)
+      -- Core's rename moves the file and renames the open buffer in place with `:saveas!`, so unsaved
+      -- changes, and the edits just applied to this very buffer, are written to the new path instead
+      -- of being dropped with a wiped buffer.
+      local moved, move_err = pcall(vim.lsp.util.rename, old_path, new_path)
+      if not moved or not vim.uv.fs_stat(new_path) or vim.uv.fs_stat(old_path) then
+        vim.notify(
+          'IntelliJ LSP: references updated but the move failed' .. (moved and '.' or (': ' .. tostring(move_err))),
+          vim.log.levels.ERROR
+        )
         return
       end
-
-      -- Reopen at the new path so the buffer is not left pointing at a file that no longer exists.
-      vim.cmd.edit(vim.fn.fnameescape(new_path))
-      vim.cmd('bwipeout! ' .. vim.fn.fnameescape(old_path))
       vim.notify('IntelliJ LSP: renamed to ' .. new_path, vim.log.levels.INFO)
     end)
   end)

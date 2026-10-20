@@ -515,34 +515,14 @@ local function server(fargs)
   activation.ask_server(target)
 end
 
---- How long `reset` waits for the servers to exit before it forces them.
-M.STOP_TIMEOUT = 10000
-
---- Calls back once every client has exited, forcing those still running after `M.STOP_TIMEOUT`.
-local function when_stopped(clients, done)
-  local waited = 0
-  local timer = assert(vim.uv.new_timer())
-  timer:start(0, 100, vim.schedule_wrap(function()
-    if timer:is_closing() then return end
-    local running = vim.tbl_filter(function(c) return not c:is_stopped() end, clients)
-    if #running > 0 and waited < M.STOP_TIMEOUT then
-      waited = waited + 100
-      return
-    end
-    for _, c in ipairs(running) do c:stop(true) end
-    timer:stop()
-    timer:close()
-    done()
-  end))
-end
-
 --- `reset [--account]`: stops the servers, then removes this machine's server license
 --- (`license reset`), the EULA acceptance (`--reset-eula`), the stored consent answers, and with
 --- `--account` the JetBrains Account sign-in. Through the CLI with no server running, so nothing
 --- holds the store meanwhile and it works the same whether or not one ran.
 --- @param fargs string[]
 --- @param cfg table
---- @param stop_all fun() stops every server and resets their per-client state
+--- @param stop_all fun(done: fun()) stops every server, resets their per-client state, and calls
+---   `done` once they have exited
 function M.reset(fargs, cfg, stop_all)
   local account = fargs[1] == '--account'
   if (fargs[1] and not account) or fargs[2] then return usage('reset [--account]') end
@@ -551,10 +531,8 @@ function M.reset(fargs, cfg, stop_all)
     .. 'and forgets the EULA acceptance and the region and data-sharing answers.'
   if account then prompt = prompt .. ' It also signs out of the JetBrains Account; ' .. SHARED_SIGN_IN end
   M._confirm(prompt, 'Reset', function()
-    local clients = vim.lsp.get_clients({ name = require('intellij-lsp.client').NAME })
     activation.cancel_login()
-    stop_all()
-    when_stopped(clients, function()
+    stop_all(function()
       local args = { 'license', 'reset' }
       if account then table.insert(args, '--account') end
       M.cli(cfg, args, function(code, stdout, stderr)

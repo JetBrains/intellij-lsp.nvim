@@ -322,7 +322,7 @@ function M.offer_activation(client, view, env_var)
   if env_var then
     text = view.message .. ' ' .. M.environment_message(env_var)
   else
-    local launcher = client.config.cmd and client.config.cmd[1] or 'intellij-server'
+    local launcher = client.config.server_cmd and client.config.server_cmd[1] or 'intellij-server'
     text = view.message .. (' Run `%s license trial` or `%s license login` in a terminal;'):format(launcher, launcher)
       .. ' the server picks the license up within seconds.'
   end

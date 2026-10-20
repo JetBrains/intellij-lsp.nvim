@@ -27,11 +27,26 @@ function M.is_snippet_edit(edit)
   return type(edit) == 'table' and type(edit.snippet) == 'table' and type(edit.snippet.value) == 'string'
 end
 
+--- Whether the buffer has changed since the version the edit was computed against.
+---
+--- The rule `apply_text_document_edit` applies before it skips a document as "newer than edits".
+--- It has to be asked before anything is applied: once the plain edits of the same change land, the
+--- buffer is newer than any version the server stamped.
+--- @param text_document table a `VersionedTextDocumentIdentifier`
+--- @return boolean
+function M.is_stale(text_document)
+  local version = text_document.version
+  if type(version) ~= 'number' or version <= 0 then return false end
+  return vim.lsp.util.buf_versions[vim.uri_to_bufnr(text_document.uri)] > version
+end
+
 --- Removes every snippet edit from `workspace_edit`, in place, and returns them with their URIs.
 ---
 --- Only `documentChanges` can carry them; the server never puts a snippet in the legacy `changes`
 --- map. A `TextDocumentEdit` left with no edits is kept: applying an empty edit list is harmless,
---- and the document's version check still runs.
+--- and the document's version check still runs. A snippet for a document that is already stale is
+--- removed and dropped: Neovim skips the rest of that document's edits, and the snippet's range
+--- would land on text the server never saw.
 --- @param workspace_edit table|nil
 --- @return { uri: string, edit: table }[]
 function M.extract(workspace_edit)
@@ -40,9 +55,10 @@ function M.extract(workspace_edit)
   for _, change in ipairs(workspace_edit.documentChanges) do
     if change.textDocument and type(change.edits) == 'table' then
       local kept = {}
+      local stale = M.is_stale(change.textDocument)
       for _, edit in ipairs(change.edits) do
         if M.is_snippet_edit(edit) then
-          found[#found + 1] = { uri = change.textDocument.uri, edit = edit }
+          if not stale then found[#found + 1] = { uri = change.textDocument.uri, edit = edit } end
         else
           kept[#kept + 1] = edit
         end

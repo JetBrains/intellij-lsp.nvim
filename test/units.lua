@@ -138,6 +138,28 @@ check('consent full -> INTELLIJ_DATA_SHARING=full', launch.build_env(nil, { data
 local none_env = launch.build_env(nil, { region = 'europe', data_sharing = 'none' })
 check("data_sharing 'none' leaves the variable out", none_env.INTELLIJ_DATA_SHARING == nil, tostring(none_env.INTELLIJ_DATA_SHARING))
 check('no region -> inherited INTELLIJ_REGION still cleared', launch.build_env(nil, { data_sharing = 'full' }).INTELLIJ_REGION == nil)
+
+-- Absent from the table is not absent from the child: vim.system merges over Neovim's environment.
+-- So look at what a real child process received.
+do
+  local out = vim.fn.tempname()
+  local spawn = launch.spawn({ 'sh', '-c', 'env > ' .. vim.fn.shellescape(out) },
+    launch.build_env(nil, { region = 'apac', data_sharing = 'none' }))
+  local exited = false
+  local ok, err = pcall(spawn, { on_exit = function() exited = true end }, {})
+  vim.wait(5000, function() return exited end, 20)
+  local child = {}
+  for _, line in ipairs(vim.uv.fs_stat(out) and vim.fn.readfile(out) or {}) do
+    local k, v = line:match('^([%w_]+)=(.*)$')
+    if k then child[k] = v end
+  end
+  check('spawn starts the child', ok and exited and child.PATH ~= nil, tostring(err))
+  check('child: inherited INTELLIJ_DATA_SHARING is unset', child.INTELLIJ_DATA_SHARING == nil, child.INTELLIJ_DATA_SHARING)
+  check('child: inherited IJ_LAUNCHER_DEBUG is unset', child.IJ_LAUNCHER_DEBUG == nil, child.IJ_LAUNCHER_DEBUG)
+  check('child: consent region replaces the inherited one', child.INTELLIJ_REGION == 'apac', child.INTELLIJ_REGION)
+  check("spawn puts Neovim's own environment back",
+    vim.env.INTELLIJ_DATA_SHARING == 'full' and vim.env.IJ_LAUNCHER_DEBUG == '1' and vim.env.INTELLIJ_REGION == 'europe')
+end
 vim.env.IJ_LAUNCHER_DEBUG, vim.env.INTELLIJ_DATA_SHARING, vim.env.INTELLIJ_REGION = nil, nil, nil
 
 do -- scoped: Lua allows 200 locals per chunk
@@ -219,12 +241,12 @@ check('dev bundle: no EULA to ask', #r.missing == 0 and r.sources.eula == 'bundl
 -- client.config launches with what consent settled
 local ccfg = client.config('/tmp/ijconsent', { server_path = cbundle .. '/bin/intellij-server' },
   { eula_accepted = true, region = 'americas', data_sharing = 'anonymous' })
-check('settled EULA -> --eula <hash>', vim.tbl_contains(ccfg.cmd, '--eula') and vim.tbl_contains(ccfg.cmd, chash), table.concat(ccfg.cmd, ' '))
+check('settled EULA -> --eula <hash>', vim.tbl_contains(ccfg.server_cmd, '--eula') and vim.tbl_contains(ccfg.server_cmd, chash), table.concat(ccfg.server_cmd, ' '))
 check('settled region in cmd_env', ccfg.cmd_env.INTELLIJ_REGION == 'americas')
 check('settled data sharing in cmd_env', ccfg.cmd_env.INTELLIJ_DATA_SHARING == 'anonymous')
 local unsettled = client.config('/tmp/ijconsent', { server_path = cbundle .. '/bin/intellij-server' },
   { eula_accepted = false })
-check('unaccepted EULA -> no --eula', not vim.tbl_contains(unsettled.cmd, '--eula'))
+check('unaccepted EULA -> no --eula', not vim.tbl_contains(unsettled.server_cmd, '--eula'))
 check('external showDocument goes to signin.lua',
   ccfg.handlers['window/showDocument'] == require('intellij-lsp.signin').show_document)
 launch.release_system_path(ccfg.system_path)
@@ -1418,6 +1440,36 @@ if snip_client and snip_client.initialized then
   check('applyEdit handler applies the plain edit', lines[1] == 'class Renamed {', lines[1])
   check('applyEdit handler expands the snippet edit', lines[2] == '    int x = compute(arg);', lines[2])
   check('applyEdit handler still answers applied', reply and reply.applied == true, vim.inspect(reply))
+
+  -- Stale: Neovim skips the document's plain edits as "newer than edits", and the snippet with them.
+  pcall(vim.snippet.stop)
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<Esc>', true, false, true), 'nx', false)
+  local function versioned(version)
+    return { edit = { documentChanges = {
+      { textDocument = { uri = snip_uri, version = version }, edits = {
+        { range = { start = { line = 0, character = 6 }, ['end'] = { line = 0, character = 13 } }, newText = 'Again' },
+        { range = { start = { line = 1, character = 12 }, ['end'] = { line = 1, character = 24 } }, snippet = { kind = 'snippet', value = 'other(${1:x})$0' } },
+      } },
+    } } }
+  end
+  vim.api.nvim_buf_set_lines(snip_buf, 0, -1, false, { 'class Renamed {', '    int x = compute(arg);', '}' })
+  vim.lsp.util.buf_versions[snip_buf] = 10
+  local real_print = print
+  print = function() end
+  handler(nil, versioned(2), { client_id = snip_id, method = 'workspace/applyEdit' })
+  print = real_print
+  vim.cmd('stopinsert')
+  local stale_lines = vim.api.nvim_buf_get_lines(snip_buf, 0, -1, false)
+  check('a stale snippet edit leaves the newer buffer untouched',
+    stale_lines[1] == 'class Renamed {' and stale_lines[2] == '    int x = compute(arg);', vim.inspect(stale_lines))
+  check('a stale snippet is not extracted', #snippet_edit.extract(versioned(2).edit) == 0)
+  check('a current snippet is extracted', #snippet_edit.extract(versioned(10).edit) == 1)
+  handler(nil, versioned(10), { client_id = snip_id, method = 'workspace/applyEdit' })
+  vim.cmd('stopinsert')
+  local current_lines = vim.api.nvim_buf_get_lines(snip_buf, 0, -1, false)
+  check('a current snippet edit still expands',
+    current_lines[1] == 'class Again {' and current_lines[2] == '    int x = other(x);', vim.inspect(current_lines))
+  vim.lsp.util.buf_versions[snip_buf] = nil
   vim.lsp.stop_client(snip_id, true)
 else
   check('snippet client starts', false)
@@ -1908,6 +1960,81 @@ vim.fn.delete(lock .. '/pid')
 check('fresh lock without pid is not stale', server_download._lock_is_stale(lock) == false)
 server_download._release_lock(vdir)
 check('release removes the lock', vim.fn.isdirectory(lock) == 0)
+
+-- Install: the bundle is published only once extracted whole. A local archive over file:// stands
+-- in for the download.
+;(function()
+  local bundles = require('intellij-lsp.server_bundles')
+  local saved_bundle, saved_root = bundles.bundle, server_download.cache_root
+  local work = vim.fs.normalize(vim.fn.tempname() .. '-install')
+  local root = work .. '/cache'
+  vim.fn.mkdir(work .. '/src/intellij-server-9.9/bin', 'p')
+  vim.fn.mkdir(work .. '/src/intellij-server-9.9/lib', 'p')
+  vim.fn.writefile({ '#!/bin/sh' }, work .. '/src/intellij-server-9.9/bin/intellij-server')
+  vim.fn.writefile({ 'runtime' }, work .. '/src/intellij-server-9.9/lib/runtime.jar')
+  local archive = work .. '/intellij-server-9.9.tar.gz'
+  vim.system({ 'tar', '-czf', archive, '-C', work .. '/src', 'intellij-server-9.9' }):wait()
+  bundles.bundle = function()
+    return { url = 'file://' .. archive, version = '9.9', sha256 = server_download._sha256_file(archive),
+      size = vim.uv.fs_stat(archive).size }
+  end
+  server_download.cache_root = function() return root end
+  local version_dir = root .. '/9.9'
+  local launcher = version_dir .. '/bin/intellij-server'
+
+  local function ensure()
+    local got
+    server_download.ensure(function(path, err) got = { path = path, err = err } end)
+    return function() return got end
+  end
+
+  -- An extraction cut short: the launcher is there, the rest is not, and it is not taken as installed.
+  vim.fn.mkdir(version_dir .. '.partial/bin', 'p')
+  vim.fn.writefile({ '#!/bin/sh' }, version_dir .. '.partial/bin/intellij-server')
+  -- What another instance polling for the launcher sees right after `tar` exits, before this one
+  -- has checked and published the bundle.
+  local real_system = vim.system
+  local visible_mid_install
+  vim.system = function(cmd, opts, on_exit)
+    if cmd[1] == 'tar' and cmd[2] == '-xzf' then
+      return real_system(cmd, opts, function(r)
+        visible_mid_install = vim.uv.fs_stat(launcher) ~= nil
+        on_exit(r)
+      end)
+    end
+    return real_system(cmd, opts, on_exit)
+  end
+  local result = ensure()
+  vim.wait(10000, function() return result() ~= nil end, 20)
+  vim.system = real_system
+  check('install: the launcher appears only once the bundle is published', visible_mid_install == false,
+    tostring(visible_mid_install))
+  check('install: an interrupted extraction is installed again, not accepted',
+    result() and result().path == launcher and vim.fn.filereadable(version_dir .. '/lib/runtime.jar') == 1,
+    vim.inspect(result()))
+  check('install: no staging directory is left behind', vim.fn.isdirectory(version_dir .. '.partial') == 0)
+  check('install: the launcher is executable', vim.fn.getfperm(launcher):sub(3, 3) == 'x', vim.fn.getfperm(launcher))
+
+  -- Another instance mid-extraction: this one waits for the bundle instead of reporting success early.
+  vim.fn.delete(version_dir, 'rf')
+  vim.fn.mkdir(version_dir .. '.lock', 'p')
+  vim.fn.writefile({ tostring(vim.uv.os_getppid()) }, version_dir .. '.lock/pid')
+  vim.fn.mkdir(version_dir .. '.partial/bin', 'p')
+  vim.fn.writefile({ '#!/bin/sh' }, version_dir .. '.partial/bin/intellij-server')
+  result = ensure()
+  vim.wait(1500)
+  check('install: waits while another instance extracts', result() == nil, vim.inspect(result()))
+  vim.fn.mkdir(version_dir .. '.partial/lib', 'p')
+  vim.fn.writefile({ 'runtime' }, version_dir .. '.partial/lib/runtime.jar')
+  vim.uv.fs_rename(version_dir .. '.partial', version_dir)
+  vim.fn.delete(version_dir .. '.lock', 'rf')
+  vim.wait(3000, function() return result() ~= nil end, 20)
+  check('install: and takes the bundle once it is published', result() and result().path == launcher
+    and vim.fn.filereadable(version_dir .. '/lib/runtime.jar') == 1, vim.inspect(result()))
+
+  bundles.bundle, server_download.cache_root = saved_bundle, saved_root
+  vim.fn.delete(work, 'rf')
+end)()
 
 -- ---------------------------------------------------------------------------
 -- Output panel: jump targets, import-log highlighting, and the shared buffer
@@ -2630,7 +2757,7 @@ do
     return {
       id = id,
       server_capabilities = { experimental = { licensing = true } },
-      config = { cmd = { '/b/bin/intellij-server' }, cmd_env = env or {} },
+      config = { server_cmd = { '/b/bin/intellij-server' }, cmd_env = env or {} },
       request = function(_, method, _, handler)
         local name = method:gsub('^jetbrains/licensing/', '')
         table.insert(sent, { id = id, name = name })
@@ -2749,7 +2876,7 @@ do
   local notified = {}
   local orig_notify = vim.notify
   vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
-  local c = { config = { cmd = { '/b/bin/intellij-server' } } }
+  local c = { config = { server_cmd = { '/b/bin/intellij-server' } } }
   licensing.offer_activation(c, licensing.project(CAPTURED_PARKED), nil)
   licensing.offer_activation(c, licensing.project(CAPTURED_PARKED), 'INTELLIJ_SERVER_LICENSE')
   vim.notify = orig_notify
@@ -2811,7 +2938,7 @@ local function fake(id, replies)
   local c = {
     id = id,
     server_capabilities = { experimental = { licensing = true } },
-    config = { cmd = { '/b/bin/intellij-server' }, cmd_env = {} },
+    config = { server_cmd = { '/b/bin/intellij-server' }, cmd_env = {} },
     is_stopped = function() return false end,
     cancel_request = function() end,
   }
@@ -3195,7 +3322,7 @@ local function fake(id, login_reply)
   local c = {
     id = id,
     server_capabilities = { experimental = { licensing = true } },
-    config = { cmd = { '/b/bin/intellij-server', '--stdio' }, cmd_env = { IJ_JAVA_OPTIONS = '-Dx=1' } },
+    config = { server_cmd = { '/b/bin/intellij-server', '--stdio' }, cmd_env = { IJ_JAVA_OPTIONS = '-Dx=1' } },
     is_stopped = function() return false end,
     cancel_request = function() end,
   }
@@ -3377,7 +3504,7 @@ local function fake(id, replies, env)
   local c = {
     id = id,
     server_capabilities = { experimental = { licensing = true } },
-    config = { cmd = { '/b/bin/intellij-server' }, cmd_env = env or {} },
+    config = { server_cmd = { '/b/bin/intellij-server' }, cmd_env = env or {} },
     is_stopped = function() return false end,
     cancel_request = function() end,
   }
@@ -3645,7 +3772,7 @@ vim.fn.writefile({ '{"region":"europe"}' }, store)
 vim.fn.writefile({}, log)
 local stopped = 0
 license._confirm = function(prompt, label, yes) chose = { prompt, label } yes() end
-license.SUBCOMMANDS.reset.run({ '--account' }, { config = cfg, stop_all = function() stopped = stopped + 1 end })
+license.SUBCOMMANDS.reset.run({ '--account' }, { config = cfg, stop_all = function(done) stopped = stopped + 1 done() end })
 check('reset: reports what it removed', wait_notified('reset the license and the account sign-in, the EULA acceptance, the stored consent answers')
   and last().level == vim.log.levels.INFO, vim.inspect(last()))
 check('reset: asked first, naming the account', chose[2] == 'Reset' and chose[1]:find('signs out of the JetBrains Account', 1, true))
@@ -4141,6 +4268,368 @@ for name, sh in pairs(floats) do
   if not sh.title:find('Java and Kotlin by IntelliJ IDEA', 1, true) then off[name] = sh.title end
 end
 check('every licensing float names the product', vim.tbl_isempty(off), vim.inspect(off))
+end)()
+
+-- ---------------------------------------------------------------------------
+-- Restart and cache clearing wait for the old server to exit
+-- ---------------------------------------------------------------------------
+-- Stand-in servers that take their time to exit, or never answer `initialize`. Every launch goes
+-- through `client.config`, so swapping its `cmd` covers the replacement servers too.
+;(function()
+  local init = require('intellij-lsp')
+  local consent = require('intellij-lsp.consent')
+  local saved = { config = init.config, client_config = client.config, store = consent.store_path,
+    stop = init.STOP_TIMEOUT, kill = init.KILL_TIMEOUT, notify = vim.notify }
+  local proj = vim.fs.normalize(vim.uv.fs_realpath(vim.fn.tempname()) or vim.fn.tempname())
+  if vim.uv.fs_stat(proj) == nil then vim.fn.mkdir(proj, 'p') end
+  proj = vim.uv.fs_realpath(proj)
+  vim.fn.writefile({ '<project/>' }, proj .. '/pom.xml')
+  vim.fn.writefile({ 'class Main {}' }, proj .. '/Main.java')
+  local index = proj .. '-index'
+  local store = vim.fn.tempname() .. '-restart.json'
+  consent.store_path = function() return store end
+  consent._reset()
+  init.config = { server_path = SERVER, region = 'europe', data_sharing = 'none' }
+  local notes = {}
+  vim.notify = function(msg) notes[#notes + 1] = msg end
+
+  local mode = { exit_ms = 0, initialize = true, exits = true }
+  local alive, overlapped, owner_at_start = 0, false, {}
+  client.config = function(root, cfg, settled)
+    local c = saved.client_config(root, cfg, settled)
+    c.cmd = function(dispatch)
+      if alive > 0 then overlapped = true end
+      owner_at_start[#owner_at_start + 1] = launch.system_path_owner(c.system_path)
+      alive = alive + 1
+      local gone = false
+      local function exit()
+        if gone or not mode.exits then return end
+        vim.defer_fn(function()
+          gone = true
+          alive = alive - 1
+          dispatch.on_exit(0, 15)
+        end, mode.exit_ms)
+      end
+      return {
+        request = function(method, _, callback)
+          if method == 'initialize' and mode.initialize then
+            vim.schedule(function()
+              callback(nil, { capabilities = { experimental = { indexDir = index } } })
+            end)
+          elseif method == 'shutdown' then
+            vim.schedule(function() callback(nil, nil) end)
+          end
+          return true, 1
+        end,
+        notify = function(method)
+          if method == 'exit' then exit() end
+          return true
+        end,
+        is_closing = function() return gone end,
+        terminate = exit,
+      }
+    end
+    return c
+  end
+
+  local function ours()
+    return vim.tbl_filter(function(c) return c.config.root_dir == proj end,
+      vim.lsp.get_clients({ name = client.NAME, _uninitialized = true }))
+  end
+
+  local src = vim.fn.bufadd(proj .. '/Main.java')
+  vim.fn.bufload(src)
+  vim.bo[src].filetype = 'java'
+  init._start_for_buffer(src)
+  vim.wait(2000, function() return #ours() == 1 and ours()[1].initialized end, 20)
+  local first = ours()[1]
+  check('restart fixture: a server runs', first ~= nil and first.initialized and alive == 1, alive)
+
+  if first then
+    -- Slow shutdown: two seconds of the old server going on holding the cache directory.
+    mode.exit_ms = 1500
+    init.restart()
+    vim.wait(700)
+    check('restart: no replacement while the old server is alive', alive == 1 and #vim.tbl_filter(function(c)
+      return c.id ~= first.id end, ours()) == 0, alive)
+    vim.wait(4000, function()
+      local now = ours()
+      return #now == 1 and now[1].id ~= first.id and now[1].initialized
+    end, 20)
+    local second = ours()[1]
+    check('restart: the replacement starts once the old one has exited', second and second.id ~= first.id and alive == 1,
+      second and second.id)
+    check('restart: the two servers never overlapped', not overlapped)
+    vim.wait(300)
+    check("restart: the old exit leaves the replacement's claim alone",
+      second and launch.system_path_owner(second.config.system_path) == vim.uv.os_getpid(),
+      second and tostring(launch.system_path_owner(second.config.system_path)))
+
+    -- Clear cache: the index survives as long as the server that has it open.
+    vim.fn.mkdir(index, 'p')
+    init.clear_cache()
+    vim.wait(700)
+    check('clear cache: the index is kept while the server is alive', vim.uv.fs_stat(index) ~= nil and alive == 1)
+    vim.wait(4000, function() return #ours() == 1 and ours()[1].id ~= second.id end, 20)
+    check('clear cache: the index is deleted once the server has exited', vim.uv.fs_stat(index) == nil)
+    check('clear cache: then a server starts again', #ours() == 1 and ours()[1].id ~= second.id and not overlapped)
+
+    -- Stuck in `initialize`: still found, stopped and replaced.
+    mode.exit_ms, mode.initialize = 0, false
+    init.restart()
+    vim.wait(2000, function() return #ours() == 1 and not ours()[1].initialized end, 20)
+    local stuck = ours()[1]
+    check('restart fixture: a server stuck in initialize', stuck and not stuck.initialized)
+    mode.initialize = true
+    init.restart()
+    vim.wait(3000, function() return #ours() == 1 and ours()[1].id ~= stuck.id and ours()[1].initialized end, 20)
+    check('restart: a server stuck in initialize is replaced', #ours() == 1 and ours()[1].id ~= (stuck and stuck.id),
+      vim.inspect(vim.tbl_map(function(c) return c.id end, ours())))
+
+    -- One that never exits: reported, and nothing starts on top of it.
+    init.STOP_TIMEOUT, init.KILL_TIMEOUT = 200, 200
+    mode.exits = false
+    local immortal = ours()[1]
+    notes = {}
+    init.restart()
+    vim.wait(1500, function() return #notes > 0 end, 20)
+    check('restart: a server that will not exit is reported', (notes[1] or ''):find('did not exit', 1, true), vim.inspect(notes))
+    check('restart: and no second server starts beside it', #ours() == 1 and ours()[1].id == immortal.id and alive == 1, alive)
+  end
+
+  init.STOP_TIMEOUT, init.KILL_TIMEOUT = saved.stop, saved.kill
+  mode.exits = true
+  for _, c in ipairs(ours()) do c:stop(true) end
+  vim.wait(1000, function() return #ours() == 0 end, 20)
+  vim.notify, client.config, consent.store_path, init.config = saved.notify, saved.client_config, saved.store, saved.config
+  vim.api.nvim_buf_delete(src, { force = true })
+end)()
+
+-- ---------------------------------------------------------------------------
+-- :IntellijLspRename keeps the buffer: unsaved changes and the server's edits survive the move
+-- ---------------------------------------------------------------------------
+;(function()
+  local init = require('intellij-lsp')
+  local dir = vim.uv.fs_realpath(vim.fn.tempname()) or vim.fn.tempname()
+  vim.fn.mkdir(dir, 'p')
+  dir = vim.uv.fs_realpath(dir)
+  local old, new, user = dir .. '/Old.java', dir .. '/New.java', dir .. '/User.java'
+  vim.fn.writefile({ 'class Old {', '}' }, old)
+  vim.fn.writefile({ 'class User { Old o; }' }, user)
+  local function edit(uri, line, from, to, text)
+    return { textDocument = { uri = uri, version = vim.NIL }, edits = {
+      { range = { start = { line = line, character = from }, ['end'] = { line = line, character = to } }, newText = text },
+    } }
+  end
+  local renamed
+  local cfg = vim.tbl_extend('force', client.config(dir, {}), {
+    root_dir = dir,
+    cmd = function(dispatch)
+      return {
+        request = function(method, params, callback)
+          if method == 'initialize' then
+            vim.schedule(function() callback(nil, { capabilities = {} }) end)
+          elseif method == 'workspace/willRenameFiles' then
+            renamed = params.files[1]
+            vim.schedule(function()
+              callback(nil, { documentChanges = {
+                edit(params.files[1].oldUri, 0, 6, 9, 'New'),
+                edit(vim.uri_from_fname(user), 0, 13, 16, 'New'),
+              } })
+            end)
+          elseif method == 'shutdown' then
+            callback(nil, nil)
+          end
+          return true, 1
+        end,
+        notify = function(method)
+          if method == 'exit' then dispatch.on_exit(0, 0) end
+          return true
+        end,
+        is_closing = function() return false end,
+        terminate = function() dispatch.on_exit(0, 15) end,
+      }
+    end,
+  })
+  local id = vim.lsp.start(cfg, { attach = false })
+  local c = id and vim.lsp.get_client_by_id(id)
+  vim.wait(2000, function() return c and c.initialized end, 20)
+
+  local hidden = vim.o.hidden
+  vim.o.hidden = true
+  vim.cmd.edit(vim.fn.fnameescape(old))
+  local buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(buf, 1, 1, false, { '  int unsaved;' })
+  local real_notify = vim.notify
+  local notes = {}
+  vim.notify = function(msg) notes[#notes + 1] = msg end
+  init.rename_file(new)
+  vim.wait(3000, function() return #notes > 0 end, 20)
+  vim.notify = real_notify
+
+  check('rename: asks the server about the move', renamed and renamed.newUri == vim.uri_from_fname(new), vim.inspect(renamed))
+  check('rename: reports success', (notes[1] or ''):find('renamed to', 1, true), vim.inspect(notes))
+  check('rename: the old file is gone', vim.uv.fs_stat(old) == nil)
+  local on_disk = vim.uv.fs_stat(new) and vim.fn.readfile(new) or {}
+  check('rename: the moved file keeps the unsaved change and the server edit',
+    on_disk[1] == 'class New {' and on_disk[2] == '  int unsaved;', vim.inspect(on_disk))
+  check('rename: the same buffer now has the new name',
+    vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf) == new and vim.api.nvim_get_current_buf() == buf,
+    vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf))
+  check('rename: the buffer is not left modified', vim.api.nvim_buf_is_valid(buf) and not vim.bo[buf].modified)
+  local ref = vim.fn.bufnr(user)
+  check('rename: references elsewhere are updated',
+    ref > 0 and vim.api.nvim_buf_get_lines(ref, 0, 1, false)[1] == 'class User { New o; }',
+    ref > 0 and vim.api.nvim_buf_get_lines(ref, 0, 1, false)[1])
+  local write_ok, write_err = pcall(vim.cmd, 'write')
+  check('rename: a later :write needs no !', write_ok, tostring(write_err))
+
+  -- A taken name is refused before the server is asked, so no reference points at a file that never moved.
+  renamed, notes = nil, {}
+  vim.notify = function(msg) notes[#notes + 1] = msg end
+  init.rename_file(user)
+  vim.notify = real_notify
+  check('rename: an existing target is refused up front', renamed == nil and (notes[1] or ''):find('already exists', 1, true),
+    vim.inspect(notes))
+
+  vim.o.hidden = hidden
+  vim.lsp.stop_client(id, true)
+  for _, b in ipairs({ buf, ref }) do
+    if b > 0 and vim.api.nvim_buf_is_valid(b) then vim.api.nvim_buf_delete(b, { force = true }) end
+  end
+end)()
+
+-- ---------------------------------------------------------------------------
+-- Run and debug with two projects open, and next to another adapter's sessions
+-- ---------------------------------------------------------------------------
+-- A stand-in nvim-dap: listeners and adapters as tables, `run` recorded. run.lua and debug.lua are
+-- loaded afresh against it, since both wire their listeners when nvim-dap is there.
+;(function()
+  local listeners = {}
+  for _, phase in ipairs({ 'before', 'after' }) do
+    listeners[phase] = setmetatable({}, { __index = function(t, k) t[k] = {}; return t[k] end })
+  end
+  local runs = {}
+  local fake_dap = { listeners = listeners, adapters = {}, run = function(config) runs[#runs + 1] = config end,
+    session = function() return nil end }
+  local saved = { run = package.loaded['intellij-lsp.run'], debug = package.loaded['intellij-lsp.debug'] }
+  package.loaded['dap'] = fake_dap
+  package.loaded['intellij-lsp.run'], package.loaded['intellij-lsp.debug'] = nil, nil
+  local run_mod = require('intellij-lsp.run')
+  local debug_mod = require('intellij-lsp.debug')
+  run_mod.setup()
+  debug_mod.setup()
+
+  local seen = {} --- @type { root: string, method: string, command: string|nil }[]
+  local function project(name)
+    local root = vim.fs.normalize(vim.fn.tempname() .. '-' .. name)
+    vim.fn.mkdir(root, 'p')
+    vim.fn.writefile({ '<project/>' }, root .. '/pom.xml')
+    vim.fn.writefile({ 'package p;', 'class Main {', '}' }, root .. '/Main.java')
+    local cmd = function(dispatch)
+      return {
+        request = function(method, params, callback)
+          if method ~= 'initialize' and method ~= 'shutdown' then
+            seen[#seen + 1] = { root = root, method = method, command = params and params.command }
+          end
+          local result
+          if method == 'initialize' then
+            result = { capabilities = { documentSymbolProvider = true, executeCommandProvider = { commands = {} } } }
+          elseif method == 'textDocument/documentSymbol' then
+            result = { { name = 'Main', kind = 5, range = rng(1, 0, 1), selectionRange = rng(1, 6, 10) } }
+          elseif params and params.command == 'intellij.java.resolveLaunch' then
+            result = { javaExec = '/jdk-' .. name .. '/bin/java', classpath = { root .. '/target/classes' }, workingDirectory = root }
+          elseif params and params.command == 'start_debug_server' then
+            result = 5005
+          end
+          vim.schedule(function() callback(nil, result) end)
+          return true, 1
+        end,
+        notify = function(method)
+          if method == 'exit' then dispatch.on_exit(0, 0) end
+          return true
+        end,
+        is_closing = function() return false end,
+        terminate = function() dispatch.on_exit(0, 15) end,
+      }
+    end
+    return root, { name = client.NAME, cmd = cmd, root_dir = root,
+      workspace_folders = { { uri = vim.uri_from_fname(root), name = name } } }
+  end
+
+  local root_a, cfg_a = project('a')
+  local root_b, cfg_b = project('b')
+  local id_a = vim.lsp.start(cfg_a, { attach = false })
+  local buf_b = vim.fn.bufadd(root_b .. '/Main.java')
+  vim.fn.bufload(buf_b)
+  local id_b = vim.lsp.start(cfg_b, { bufnr = buf_b })
+  vim.wait(2000, function()
+    local a, b = vim.lsp.get_client_by_id(id_a), vim.lsp.get_client_by_id(id_b)
+    return a and a.initialized and b and b.initialized
+  end, 20)
+  check('two projects: A is the first client', vim.lsp.get_clients({ name = client.NAME })[1].id == id_a)
+
+  vim.api.nvim_set_current_buf(buf_b)
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  run_mod.run_at_cursor(true, { build = false })
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  local config = runs[1]
+  check('two projects: B resolves the launch for its own class', config and config.javaExec == '/jdk-b/bin/java',
+    vim.inspect(seen))
+  local resolved_on = vim.tbl_filter(function(s) return s.command == 'intellij.java.resolveLaunch' end, seen)
+  check('two projects: A is never asked', #resolved_on == 1 and resolved_on[1].root == root_b, vim.inspect(resolved_on))
+
+  local adapter
+  fake_dap.adapters.intellij_jvm(function(a) adapter = a end, config or {})
+  vim.wait(2000, function() return adapter ~= nil end, 20)
+  local debug_on = vim.tbl_filter(function(s) return s.command == 'start_debug_server' end, seen)
+  check('two projects: the debug server starts on B', #debug_on == 1 and debug_on[1].root == root_b, vim.inspect(debug_on))
+  local sent
+  if adapter and adapter.enrich_config then adapter.enrich_config(config, function(c) sent = c end) end
+  check('two projects: the client id is not sent to the server', sent and sent.intellijClientId == nil
+    and sent.mainClass == 'Main' and config.intellijClientId == id_b, vim.inspect(sent))
+
+  -- The lens command: the client it came from, not the first one.
+  seen, runs = {}, {}
+  vim.lsp.commands['intellij.jvm.runMain']({ arguments = { { mainClass = 'p.Main' } } }, { client_id = id_b, bufnr = buf_b })
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  check('two projects: a lens launches on its own server', runs[1] and runs[1].javaExec == '/jdk-b/bin/java', vim.inspect(seen))
+
+  -- Another adapter's session: no IntelliJ panel, no stack requests, no output in the panel.
+  local requests = {}
+  local function session(id, type_)
+    return { id = id, config = { type = type_ }, stopped_thread_id = nil,
+      request = function(_, command) requests[#requests + 1] = { session = id, command = command } end }
+  end
+  local py, jvm = session(91, 'python'), session(92, 'intellij_jvm')
+  local wins = #vim.api.nvim_list_wins()
+  local output_mod = require('intellij-lsp.output')
+  output_mod._reset()
+  listeners.before.event_output['intellij-lsp.run.panel'](py, { output = 'python says hi\n' })
+  listeners.after.event_output['intellij-lsp.run'](py, { output = 'python says hi\n' })
+  listeners.after.event_stopped['intellij-lsp.debug'](py, { threadId = 1 })
+  listeners.after.event_continued['intellij-lsp.debug'](py, {})
+  vim.wait(200)
+  check('another adapter: a stop sends no request to it', #requests == 0, vim.inspect(requests))
+  check('another adapter: no panel opens', #vim.api.nvim_list_wins() == wins and not output_mod.is_open(),
+    #vim.api.nvim_list_wins())
+  local panel_lines = table.concat(vim.api.nvim_buf_get_lines(output_mod.buf(), 0, -1, false), '\n')
+  check('another adapter: its output stays out of the panel', not panel_lines:find('python says hi', 1, true), panel_lines)
+
+  listeners.after.event_stopped['intellij-lsp.debug'](jvm, { threadId = 1 })
+  vim.wait(200)
+  check('own session: a stop asks for its stack', #requests == 1 and requests[1].session == 92
+    and requests[1].command == 'stackTrace', vim.inspect(requests))
+
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if #vim.api.nvim_list_wins() > 1 and vim.api.nvim_win_get_config(w).relative == '' and w ~= vim.api.nvim_get_current_win() then
+      pcall(vim.api.nvim_win_close, w, true)
+    end
+  end
+  vim.lsp.stop_client({ id_a, id_b }, true)
+  vim.api.nvim_buf_delete(buf_b, { force = true })
+  package.loaded['dap'] = nil
+  package.loaded['intellij-lsp.run'], package.loaded['intellij-lsp.debug'] = saved.run, saved.debug
 end)()
 
 print(failures == 0 and '\nALL UNIT CHECKS PASSED' or ('\n' .. failures .. ' UNIT CHECK(S) FAILED'))

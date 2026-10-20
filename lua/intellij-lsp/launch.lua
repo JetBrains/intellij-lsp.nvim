@@ -148,6 +148,7 @@ local CLEARED = { 'IJ_LAUNCHER_DEBUG', 'INTELLIJ_DATA_SHARING', 'INTELLIJ_REGION
 --- Returns the *full* environment rather than a sparse overlay: `vim.system` has no way to express
 --- "remove this variable" (a `false` value is stringified to "false", which the server then rejects
 --- as an invalid data-sharing level), so unwanted variables must be absent from the table entirely.
+--- Absent is not enough on its own either; see `spawn`.
 ---
 --- `data_sharing = 'none'` sets nothing: it is the server's default, and VS Code leaves it out too.
 --- @param jvm_args string[]|nil extra JVM options
@@ -178,6 +179,34 @@ function M.build_env(jvm_args, consent)
   end
 
   return env
+end
+
+--- A `vim.lsp.start` `cmd` function that starts the server with exactly `env`.
+---
+--- `vim.system` merges `env` over Neovim's own environment, so a variable `build_env` dropped is
+--- inherited anyway, and the LSP client offers no `clear_env`. Instead, whatever Neovim has that
+--- `env` lacks is unset in Neovim's own environment around the spawn and put back right after.
+--- The spawn is synchronous, so nothing else runs while those variables are missing.
+--- @param argv string[]
+--- @param env table<string, string>
+--- @return fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient
+function M.spawn(argv, env)
+  return function(dispatchers, config)
+    local hidden = {}
+    for key, value in pairs(vim.fn.environ()) do
+      if env[key] == nil then
+        hidden[key] = value
+        vim.uv.os_unsetenv(key)
+      end
+    end
+    local ok, rpc = pcall(vim.lsp.rpc.start, argv, dispatchers,
+      { cwd = config.cmd_cwd, env = env, detached = config.detached })
+    for key, value in pairs(hidden) do
+      vim.uv.os_setenv(key, value)
+    end
+    if not ok then error(rpc, 0) end
+    return rpc
+  end
 end
 
 return M

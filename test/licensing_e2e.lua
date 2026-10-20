@@ -180,7 +180,7 @@ check('consent passed: INTELLIJ_REGION', client.config.cmd_env.INTELLIJ_REGION =
   tostring(client.config.cmd_env.INTELLIJ_REGION))
 check('consent passed: INTELLIJ_DATA_SHARING', client.config.cmd_env.INTELLIJ_DATA_SHARING == 'anonymous',
   tostring(client.config.cmd_env.INTELLIJ_DATA_SHARING))
-check('consent passed: --eula <hash>', vim.tbl_contains(client.config.cmd, '--eula'), table.concat(client.config.cmd, ' '))
+check('consent passed: --eula <hash>', vim.tbl_contains(client.config.server_cmd, '--eula'), table.concat(client.config.server_cmd, ' '))
 check('server initialized with the consent', vim.wait(120000, function() return client.initialized end, 200))
 
 note('server ' .. (client.server_info and client.server_info.name or '?') ..

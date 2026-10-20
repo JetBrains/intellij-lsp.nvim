@@ -21,6 +21,8 @@ local output = require('intellij-lsp.output')
 --- tool launches instead, which this module does not resolve; nvim-dap here only ever runs the JVM
 --- adapter.
 local ADAPTER_ID = 'intellij_jvm'
+--- The launch configuration field naming the client that resolved the launch; see the adapter.
+local CLIENT_FIELD = 'intellijClientId'
 
 --- Whether nvim-dap is installed.
 ---
@@ -29,6 +31,15 @@ local ADAPTER_ID = 'intellij_jvm'
 --- @return boolean
 function M.has_dap()
   return (pcall(require, 'dap'))
+end
+
+--- Whether a nvim-dap session is one this plugin launched, rather than another adapter's.
+---
+--- nvim-dap's listeners are global: every session's events reach them, a Python one's included.
+--- @param session dap.Session|nil
+--- @return boolean
+function M.owns(session)
+  return session ~= nil and session.config ~= nil and session.config.type == ADAPTER_ID
 end
 
 --- Strips VS Code's codicon markup from a lens title.
@@ -58,10 +69,16 @@ local function ensure_dap_adapter()
 
   -- One DAP server per session: `start_debug_server` starts it fresh, on a free localhost port, the
   -- moment nvim-dap asks to launch -- there is nothing to keep alive between launches.
+  --
+  -- On the server that resolved the launch, which `launch` names in the configuration: with two
+  -- projects open, any other one would debug a classpath it never built. A re-run after a server
+  -- restart names a client that is gone; the server covering the working directory takes over.
   dap.adapters[ADAPTER_ID] = function(callback, config)
-    local c = vim.lsp.get_clients({ name = require('intellij-lsp.client').NAME })[1]
+    local client_module = require('intellij-lsp.client')
+    local c = config[CLIENT_FIELD] and vim.lsp.get_client_by_id(config[CLIENT_FIELD])
+    if not c and config.cwd then c = client_module.find_ancestor_client(config.cwd) end
     if not c then
-      vim.notify('IntelliJ LSP: no server running, cannot start a debug session.', vim.log.levels.ERROR)
+      vim.notify('IntelliJ LSP: no server running for this launch, cannot start a debug session.', vim.log.levels.ERROR)
       return
     end
 
@@ -79,7 +96,18 @@ local function ensure_dap_adapter()
       -- `id` is what nvim-dap sends as the DAP `initialize` request's `adapterID`; without it nvim-dap
       -- falls back to the literal string 'nvim-dap', which the server then rejects as an unknown
       -- adapter id.
-      callback({ type = 'server', host = '127.0.0.1', port = port, id = ADAPTER_ID })
+      callback({
+        type = 'server',
+        host = '127.0.0.1',
+        port = port,
+        id = ADAPTER_ID,
+        -- The client id is this plugin's routing, not a launch argument for the server.
+        enrich_config = function(launch_config, on_config)
+          local sent = vim.deepcopy(launch_config)
+          sent[CLIENT_FIELD] = nil
+          on_config(sent)
+        end,
+      })
     end)
 
     -- Unused but required by nvim-dap's adapter signature; the launch never needs to react to it.
@@ -264,10 +292,15 @@ end
 --- `noDebug = true` is what makes this a *run* rather than a *debug*: the adapter still starts the
 --- same JDWP-suspended JVM (see README "A breakpoint set before launching is honoured"), and nvim-dap
 --- simply tells the server not to wait on the debug protocol handshake for output to start flowing.
+---
+--- Every step -- build command, launch resolution, debug server -- goes to one server: the one for
+--- the class's project, not whichever started first.
 --- @param main_class string fully qualified class name
 --- @param uri string the class's source document, so the server can resolve without a round trip
 --- @param no_debug boolean
---- @param opts { build: boolean|nil }|nil `build = false` launches whatever is already compiled
+--- @param opts { build: boolean|nil, client: vim.lsp.Client|nil }|nil `build = false` launches
+---   whatever is already compiled; `client` is the server to launch on, by default the one whose
+---   project contains `uri`
 local function launch(main_class, uri, no_debug, opts)
   if not M.has_dap() then
     vim.notify('IntelliJ LSP: running requires nvim-dap (mfussenegger/nvim-dap).', vim.log.levels.ERROR)
@@ -275,9 +308,9 @@ local function launch(main_class, uri, no_debug, opts)
   end
 
   local client_module = require('intellij-lsp.client')
-  local c = vim.lsp.get_clients({ name = client_module.NAME })[1]
+  local c = opts and opts.client or client_module.find_ancestor_client(vim.uri_to_fname(uri))
   if not c then
-    vim.notify('IntelliJ LSP: no server running.', vim.log.levels.ERROR)
+    vim.notify('IntelliJ LSP: no server running for ' .. vim.uri_to_fname(uri) .. '.', vim.log.levels.ERROR)
     return
   end
 
@@ -320,6 +353,7 @@ local function launch(main_class, uri, no_debug, opts)
           -- `runInTerminal` request this client does not implement, and the panel would stay empty.
           console = 'internalConsole',
           noDebug = no_debug,
+          [CLIENT_FIELD] = c.id,
         })
       end)
     end)
@@ -344,20 +378,20 @@ M.launch = launch
 --- import log is written to. See that module for why they share one.
 
 if M.has_dap() then
-  require('dap').listeners.after.event_output['intellij-lsp.run'] = function(_, body)
-    if body and body.output then output.append(body.output) end
+  require('dap').listeners.after.event_output['intellij-lsp.run'] = function(session, body)
+    if M.owns(session) and body and body.output then output.append(body.output) end
   end
 
   -- Opens on the first output of a session rather than at launch: with none yet there is nothing to
   -- show, and opening early would steal focus before the program has said anything.
   local opened_for = nil
   require('dap').listeners.before.event_output['intellij-lsp.run.panel'] = function(session)
-    if opened_for == session.id then return end
+    if not M.owns(session) or opened_for == session.id then return end
     opened_for = session.id
     vim.schedule(output.open)
   end
   require('dap').listeners.after.event_terminated['intellij-lsp.run'] = function(session)
-    if opened_for == session.id then opened_for = nil end
+    if M.owns(session) and opened_for == session.id then opened_for = nil end
   end
 end
 
@@ -367,11 +401,12 @@ end
 --- through, so no bespoke keymap wiring is needed for the lens itself -- only for `<leader>rr` below,
 --- which has no lens to click.
 local function register_lens_command()
-  vim.lsp.commands['intellij.jvm.runMain'] = function(command)
+  vim.lsp.commands['intellij.jvm.runMain'] = function(command, ctx)
     local args = (command.arguments or {})[1] or {}
     if not args.mainClass then return end
-    local uri = args.uri or vim.uri_from_bufnr(0)
-    launch(args.mainClass, uri, args.noDebug ~= false)
+    local uri = args.uri or vim.uri_from_bufnr(ctx and ctx.bufnr or 0)
+    launch(args.mainClass, uri, args.noDebug ~= false,
+      { client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil })
   end
 end
 
@@ -464,7 +499,8 @@ function M.run_at_cursor(no_debug, opts)
         return
       end
 
-      launch(class, vim.uri_from_bufnr(bufnr), no_debug == nil or no_debug, opts)
+      launch(class, vim.uri_from_bufnr(bufnr), no_debug == nil or no_debug,
+        vim.tbl_extend('force', opts or {}, { client = c }))
     end
   )
 end

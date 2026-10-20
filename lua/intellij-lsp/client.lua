@@ -826,15 +826,20 @@ function M.config(root_dir, cfg, consent)
   release_all_on_leave()
   M.watch_init()
 
+  local argv = launch.build_cmd({
+    server_path = cfg.server_path,
+    root_dir = root_dir,
+    accept_eula = consent.eula_accepted,
+    system_path = system_path,
+  })
+  local env = launch.build_env(cfg.jvm_args, consent)
+
   return {
     name = M.NAME,
-    cmd = launch.build_cmd({
-      server_path = cfg.server_path,
-      root_dir = root_dir,
-      accept_eula = consent.eula_accepted,
-      system_path = system_path,
-    }),
-    cmd_env = launch.build_env(cfg.jvm_args, consent),
+    cmd = launch.spawn(argv, env),
+    -- What `cmd` runs, for the code that needs the launcher itself: `cmd` is a function.
+    server_cmd = argv,
+    cmd_env = env,
     root_dir = root_dir,
     -- Not a `vim.lsp.start` field: kept on the config so `:checkhealth` and the init watchdog can
     -- find this instance's server log.
