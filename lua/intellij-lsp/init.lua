@@ -152,6 +152,10 @@ local function start_for_buffer(bufnr)
     return
   end
 
+  -- Any other virtual buffer -- a Diffview or fugitive revision, a scratch -- has no file on disk for
+  -- the server to open, and its name is no path to find a root from (see `client.is_uri_name`).
+  if vim.bo[bufnr].buftype ~= '' or client.is_uri_name(name) then return end
+
   -- Attach to a server that already covers this file, whatever root it was started with.
   local existing = name ~= '' and client.find_ancestor_client(name) or nil
   if existing then

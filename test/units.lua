@@ -1177,6 +1177,27 @@ do
   start_for_buffer(orphan)
   check('a library buffer never starts a server of its own', started == 0, started)
 
+  -- Diffview and fugitive name revision buffers with a URI and set filetype=java. Walked up as a
+  -- path, the name ended at ".", where the cwd's pom.xml started a server on `file://.`.
+  for _, name in ipairs({
+    'diffview://' .. proj .. '/.git/abc1234/src/Main.java',
+    'fugitive://' .. proj .. '/.git//abc1234/src/Main.java',
+  }) do
+    local virtual = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_buf_set_name(virtual, name)
+    local scheme = name:match('^%a+')
+    check(scheme .. ' buffer: find_root finds no root', client.find_root(virtual) == nil,
+      tostring(client.find_root(virtual)))
+    start_for_buffer(virtual)
+    check(scheme .. ' buffer: no server starts', started == 0, started)
+  end
+  local scratch = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(scratch, proj .. '/Scratch.java')
+  vim.bo[scratch].buftype = 'nofile'
+  start_for_buffer(scratch)
+  check('a nofile buffer: no server starts', started == 0, started)
+  check('a Windows drive path is not a URI', not client.is_uri_name([[C:\work\Main.java]]))
+
   -- A source buffer launches through the consent gate: synchronously once it is settled, and not at
   -- all when it cannot be asked, with the attach guard cleared so a later setup can attach it.
   local init = require('intellij-lsp')

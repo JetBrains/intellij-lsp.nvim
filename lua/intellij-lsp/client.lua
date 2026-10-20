@@ -118,13 +118,25 @@ function M.build_root(dir)
   return dir
 end
 
+--- Whether a buffer name is a URI (`diffview://`, `fugitive://`, `oil://`) rather than a file path.
+---
+--- Diffview and fugitive name their revision buffers this way and give them `filetype=java`. Walked
+--- up as a path, such a name ends at the relative directory ".", the cwd's build file makes "." the
+--- root, and the server fails `initialize` on the workspace folder `file://.`. The scheme needs two
+--- characters so a Windows drive letter (`C:\`) is still a path.
+--- @param name string
+--- @return boolean
+function M.is_uri_name(name)
+  return name:match('^%a[%w+.-]+:') ~= nil
+end
+
 --- Root of the build that the buffer's file belongs to: the nearest project marker, widened by
 --- `build_root` from a module to the build that aggregates it.
 --- @param bufnr integer
 --- @return string|nil
 function M.find_root(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr)
-  if name == '' then return nil end
+  if name == '' or M.is_uri_name(name) then return nil end
   local start = vim.fs.dirname(name)
   local marker = vim.fs.find(M.ROOT_MARKERS, { path = start, upward = true })[1]
   return marker and M.build_root(vim.fs.dirname(marker)) or nil
