@@ -42,6 +42,12 @@
 --- area as long as only one lands between redraws -- two in a row stack up and raise the hit-enter
 --- prompt. So on 0.11 every echo goes through a short coalescing delay (`legacy_echo`), and Neovim's
 --- own rendering of `title` and `percent` is done by hand. See `M._progress_messages`.
+---
+--- A server without a license parks itself: it loads the workspace model, then sends nothing more
+--- until a license is activated, and the phase it stopped in ("Loading workspace model from
+--- cache...") would sit there with its dots spinning as though the load were slow. While the server
+--- declines features the line says why it is not moving instead (`M.PARKED`), and the server's own
+--- text comes back with the license. See `M.text`.
 
 local M = {}
 
@@ -75,6 +81,10 @@ local RANK = {
 --- Matches the prefix on progress.lua's `vim.notify`, so the running report and the final
 --- notification read as one conversation rather than two sources talking over each other.
 local TITLE = 'IntelliJ LSP'
+
+--- The line while the server is parked. In the same words as licensing.lua's notices, so the line,
+--- the buffer hint and the activation float all point at the one command.
+M.PARKED = 'Waiting for a license. Run :IntellijLspLicense'
 
 --- The animation: one, two, three dots, then back to one.
 ---
@@ -202,6 +212,20 @@ function M.describe(st)
   return message and (st.title .. ': ' .. message) or st.title, st.percent
 end
 
+--- What the client's line says: `M.describe`, unless the server is parked.
+---
+--- A parked server reports no percentage and gets no dots: it is waiting on the user, not working,
+--- and an animation would say the opposite. `st` still keeps the server's last phase, so the line
+--- picks up where it stopped once a license ends the parking.
+--- @param client_id integer
+--- @param st IntellijLspClientStatus|nil
+--- @return string|nil text, integer|nil percent, boolean parked
+function M.text(client_id, st)
+  local text, percent = M.describe(st)
+  if text and require('intellij-lsp.licensing').declined(client_id) then return M.PARKED, nil, true end
+  return text, percent, false
+end
+
 --- Raw state, for tests.
 --- @param client_id integer
 --- @return IntellijLspClientStatus|nil
@@ -307,11 +331,11 @@ local function report(client_id)
   local st = by_client[client_id]
   if not st then return end
 
-  local text, percent = M.describe(st)
+  local text, percent, parked = M.text(client_id, st)
   if not text then return end
   -- Decorated here, at the echo, and nowhere else: `st` keeps the server's own wording, so nothing
   -- that reads the state ever sees a dot.
-  text = M.animate(text, percent, dot_frame)
+  if not parked then text = M.animate(text, percent, dot_frame) end
 
   if not M._progress_messages then
     st.msg_id = true
@@ -341,14 +365,21 @@ end
 ---
 --- The `msg_id` test is what makes it correct rather than merely plausible. A client whose message
 --- `finish` has already closed still carries its `title` and `message`, so asking `describe` alone
---- would keep the timer alive forever after `Ready`.
+--- would keep the timer alive forever after `Ready`. A parked line is not animated either, so a
+--- session left waiting on a license holds no timer.
+--- @param client_id integer
+--- @param st IntellijLspClientStatus
+--- @return boolean
+local function animates(client_id, st)
+  if not st.msg_id then return false end
+  local text, percent, parked = M.text(client_id, st)
+  return text ~= nil and percent == nil and not parked
+end
+
 --- @return boolean
 local function any_animating()
-  for _, st in pairs(by_client) do
-    if st.msg_id then
-      local text, percent = M.describe(st)
-      if text and percent == nil then return true end
-    end
+  for client_id, st in pairs(by_client) do
+    if animates(client_id, st) then return true end
   end
   return false
 end
@@ -393,10 +424,7 @@ local function sync_dots()
       -- required -- but repainting a percentage line here would fight the server's own reports for the
       -- message area several times a second to no visible effect.
       for client_id, st in pairs(by_client) do
-        if st.msg_id then
-          local text, percent = M.describe(st)
-          if text and percent == nil then report(client_id) end
-        end
+        if animates(client_id, st) then report(client_id) end
       end
       -- A client may have finished during that loop; drop the handle rather than tick on emptily.
       sync_dots()
@@ -516,6 +544,23 @@ function M.setup_autocmds()
   require('intellij-lsp.progress').on_ready(function(client_id)
     finish(client_id, 'Ready', true)
   end)
+
+  -- A parked server sends no progress at all, so a license change is the only event that can repaint
+  -- an open line: into `M.PARKED` when the parking starts, and back to the server's last phase when a
+  -- license ends it. A line already closed stays closed; the notices and the buffer hint cover a
+  -- license lost after startup.
+  vim.api.nvim_create_autocmd('User', {
+    group = group,
+    pattern = require('intellij-lsp.licensing').EVENT,
+    callback = function(ev)
+      local data = ev.data
+      if not data or not data.view then return end
+      local st = by_client[data.client_id]
+      if not st or not st.msg_id then return end
+      report(data.client_id)
+      sync_dots()
+    end,
+  })
 end
 
 return M

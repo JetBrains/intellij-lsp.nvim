@@ -1907,6 +1907,51 @@ do
   vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify = real_get, real_echo, real_notify
 end
 
+-- Regression: a server without a license parks right after loading the workspace model and sends no
+-- more progress, so "Loading workspace model from cache..." stayed on screen, dots spinning, as
+-- though the load had hung. The line says why it is not moving, and the server's text comes back with
+-- the license.
+do
+  local licensing = require('intellij-lsp.licensing')
+  local SID = 4345
+  local real_get, real_echo, real_notify = vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify
+  local echoes = {}
+  vim.lsp.get_client_by_id = function(id) return id == SID and { name = client.NAME } or nil end
+  vim.api.nvim_echo = function(chunks, _, opts)
+    if opts.kind == 'progress' then table.insert(echoes, { status = opts.status, text = chunks[1][1] }) end
+    return opts.id or 7
+  end
+  vim.notify = function() end
+  status.setup_autocmds()
+  local function fire(kind, title, message)
+    vim.api.nvim_exec_autocmds('LspProgress', { data = { client_id = SID, params = {
+      token = 'p1', value = { kind = kind, title = title, message = message },
+    } } })
+  end
+
+  -- The server parks before its first progress report, as it does on startup.
+  licensing._set(SID, { featuresDeclined = true, parkedReason = 'StartedUnlicensed' })
+  fire('begin', 'Initializing server', 'Loading workspace model from cache...')
+  check('parked: the line says why it is not moving', echoes[#echoes].text == status.PARKED, vim.inspect(echoes[#echoes]))
+  check('parked: the line stays open', echoes[#echoes].status == 'running' and status.get(SID).msg_id ~= nil)
+  local count = #echoes
+  vim.wait(500, function() return false end)
+  check('parked: no dots ticking', #echoes == count, vim.inspect(echoes))
+
+  licensing._set(SID, { activeLicense = { source = 'activationCode', status = 'Valid', product = 'intellij-server' } })
+  check('licensed: the server text comes back', echoes[#echoes].text:find('^Initializing server: Loading workspace model from cache%.%.%. %.+$') ~= nil,
+    vim.inspect(echoes[#echoes]))
+
+  -- Parked mid-startup, after the line opened with the server's text.
+  licensing._set(SID, { featuresDeclined = true, parkedReason = 'LicenseRemoved' })
+  check('parked later: an open line is repainted', echoes[#echoes].text == status.PARKED, vim.inspect(echoes[#echoes]))
+
+  status.teardown_autocmds()
+  status.reset(SID)
+  licensing.reset(SID)
+  vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify = real_get, real_echo, real_notify
+end
+
 -- Neovim 0.11: `nvim_echo` rejects `kind = 'progress'` ("invalid key: kind"), and the pcall around it
 -- swallowed every report, so a whole import went by with nothing on screen. The fallback is a plain
 -- echo, coalesced so that a burst of reports is one echo and never stacks into the hit-enter prompt.
