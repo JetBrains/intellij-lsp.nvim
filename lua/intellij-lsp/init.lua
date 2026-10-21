@@ -9,6 +9,7 @@
 local client = require('intellij-lsp.client')
 local consent = require('intellij-lsp.consent')
 local progress = require('intellij-lsp.progress')
+local status = require('intellij-lsp.status')
 
 local M = {}
 
@@ -123,6 +124,12 @@ local function expand(path)
   return path and vim.fn.expand(path) or nil
 end
 
+--- `vim.lsp.start`, plus the progress line that covers the server's boot, which reports nothing of
+--- its own until the server reads `initialize`. See `status.starting`.
+local function start_client(config, opts)
+  status.starting(vim.lsp.start(config, opts))
+end
+
 --- Starts (or reuses) a server for the given buffer.
 ---
 --- The ancestor check is not an optimization. `vim.lsp.start` only reuses a client whose workspace
@@ -181,7 +188,7 @@ local function start_for_buffer(bufnr)
       vim.lsp.buf_attach_client(bufnr, covering.id)
       return
     end
-    vim.lsp.start(client.config(root_dir, M.config, settled), { bufnr = bufnr })
+    start_client(client.config(root_dir, M.config, settled), { bufnr = bufnr })
   end)
 end
 
@@ -252,7 +259,7 @@ local function start_eagerly()
       vim.g.intellij_lsp_eager_started = nil
       return
     end
-    vim.lsp.start(client.config(root_dir, M.config, settled), { attach = false })
+    start_client(client.config(root_dir, M.config, settled), { attach = false })
   end)
 end
 
@@ -279,7 +286,7 @@ local function stop_all(done)
   for _, c in ipairs(clients) do
     index_dir = index_dir or c.config.index_dir
     progress.reset(c.id)
-    require('intellij-lsp.status').reset(c.id)
+    status.reset(c.id)
     c:stop()
   end
   -- Decompiled sources are keyed by URI and would otherwise survive a restart, serving stale output
@@ -594,7 +601,6 @@ local function finish_setup()
   -- and this reports into the message area rather than taking over any of the user's UI. The
   -- teardown matters because plugin managers re-run specs, so setup() may run again with the flag
   -- flipped off, and the handlers from the previous call would otherwise survive.
-  local status = require('intellij-lsp.status')
   if M.config.progress then
     status.setup_autocmds()
   else

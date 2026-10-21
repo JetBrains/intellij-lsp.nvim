@@ -48,6 +48,12 @@
 --- cache...") would sit there with its dots spinning as though the load were slow. While the server
 --- declines features the line says why it is not moving instead (`M.PARKED`), and the server's own
 --- text comes back with the license. See `M.text`.
+---
+--- The server's first progress comes from its `initialize` handler, and it reads `initialize` only
+--- after the JVM is up, the bundled plugins are loaded, licensing has started and the IntelliJ
+--- application has booted. That is about a second on a laptop and 5-10 seconds on a slow VM or a
+--- cold disk, with nothing on screen. So the line opens at the spawn, reading `M.STARTING`, and
+--- hands over to whatever the server reports first. See `M.starting`.
 
 local M = {}
 
@@ -73,6 +79,7 @@ local by_client = {}
 --- percentage ticks would be a downgrade in information. Titles missing from this table still
 --- report, at rank 0 -- an unrecognised server title should be shown, not swallowed.
 local RANK = {
+  ['Starting server'] = 0,
   ['Initializing server'] = 1,
   ['Importing'] = 2,
   ['Indexing'] = 3,
@@ -85,6 +92,12 @@ local TITLE = 'IntelliJ LSP'
 --- The line while the server is parked. In the same words as licensing.lua's notices, so the line,
 --- the buffer hint and the activation float all point at the one command.
 M.PARKED = 'Waiting for a license. Run :IntellijLspLicense'
+
+--- The line from the spawn until the server's first progress, which only `M.starting` sets.
+M.STARTING = 'Starting server'
+
+--- The key that line is held under. A table, so that no token the server sends can ever be equal to it.
+local STARTING_TOKEN = {}
 
 --- The animation: one, two, three dots, then back to one.
 ---
@@ -172,6 +185,9 @@ function M.on_progress(client_id, params)
   if token == nil then return end
 
   local st = state_for(client_id)
+  -- The server is talking, so the line that covered its silent boot has done its job. Dropped on
+  -- any kind of report, because a token left over would keep `is_idle` false for the whole session.
+  st.tokens[STARTING_TOKEN] = nil
 
   if value.kind == 'end' then
     st.tokens[token] = nil
@@ -282,6 +298,10 @@ end
 
 --- @type uv.uv_timer_t|nil
 local dot_timer = nil
+
+--- Whether the subscriptions are in place, i.e. reporting is on. `M.starting` is called whatever the
+--- `progress` setting, and must open no line that nothing will ever update or close.
+local enabled = false
 
 --- The animation frame, shared by every client rather than held per client.
 ---
@@ -474,6 +494,23 @@ local function finish(client_id, final, announced)
   sync_dots()
 end
 
+--- Opens the line for a server that was just spawned, before it has said anything.
+---
+--- Skipped for a client that already has a line or has finished `initialize`: `vim.lsp.start` hands
+--- back the id of a client it reused, and that one's line is already where it should be.
+--- @param client_id integer|nil what `vim.lsp.start` returned; nil when the spawn failed
+function M.starting(client_id)
+  if not enabled or not client_id or by_client[client_id] then return end
+  local c = vim.lsp.get_client_by_id(client_id)
+  if not c or c.initialized then return end
+
+  local st = state_for(client_id)
+  st.tokens[STARTING_TOKEN] = { title = M.STARTING }
+  recompute(st)
+  report(client_id)
+  sync_dots()
+end
+
 --- Clears state for a client that has stopped, so a restart starts from a clean slate.
 --- @param client_id integer
 function M.reset(client_id)
@@ -488,6 +525,7 @@ end
 --- Removes the subscriptions, for a re-`setup()` that turns reporting off.
 function M.teardown_autocmds()
   pcall(vim.api.nvim_del_augroup_by_name, 'IntellijLspStatus')
+  enabled = false
   -- With the subscriptions gone nothing will ever repaint again, so a surviving handle would tick
   -- into a loop that finds nothing to do. `progress = false` on a re-`setup()` runs exactly this.
   stop_dots()
@@ -496,6 +534,7 @@ end
 --- Subscribes to the events that drive the report. Safe to call more than once.
 function M.setup_autocmds()
   local group = vim.api.nvim_create_augroup('IntellijLspStatus', { clear = true })
+  enabled = true
 
   -- Plugin managers re-run specs, so this may well be the second call. The augroup above replaces
   -- itself via `clear = true`, but a libuv handle has no such affordance -- it has to be released

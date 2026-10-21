@@ -1952,6 +1952,56 @@ do
   vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify = real_get, real_echo, real_notify
 end
 
+-- The server reports nothing until it reads `initialize`, which on a slow VM or a cold disk is 5-10
+-- seconds after the spawn. With nothing on screen meanwhile, Neovim looked as if it were doing nothing.
+do
+  local SID = 4346
+  local real_get, real_echo, real_notify = vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify
+  local echoes = {}
+  local fake = { name = client.NAME, initialized = false }
+  vim.lsp.get_client_by_id = function(id) return id == SID and fake or nil end
+  vim.api.nvim_echo = function(chunks, _, opts)
+    if opts.kind == 'progress' then table.insert(echoes, { status = opts.status, text = chunks[1][1] }) end
+    return opts.id or 7
+  end
+  vim.notify = function() end
+
+  status.starting(SID)
+  check('starting: no line while reporting is off', status.get(SID) == nil and #echoes == 0, vim.inspect(echoes))
+
+  status.setup_autocmds()
+  status.starting(nil)
+  check('starting: a failed spawn opens nothing', #echoes == 0)
+
+  status.starting(SID)
+  check('starting: the line opens at the spawn', echoes[1] and echoes[1].status == 'running'
+    and echoes[1].text:find('^' .. status.STARTING .. ' %.+$') ~= nil, vim.inspect(echoes[1]))
+  check('starting: not idle while the server boots', not status.is_idle(SID))
+  local count = #echoes
+  status.starting(SID)
+  check('starting: a reused client is not reopened', #echoes == count)
+
+  vim.api.nvim_exec_autocmds('LspProgress', { data = { client_id = SID, params = {
+    token = client.INIT_TOKEN, value = { kind = 'begin', title = 'Initializing server', message = 'Initializing IntelliJ' },
+  } } })
+  check('starting: the server text takes over', echoes[#echoes].text:find('^Initializing server: Initializing IntelliJ %.+$') ~= nil,
+    vim.inspect(echoes[#echoes]))
+  vim.api.nvim_exec_autocmds('LspProgress', { data = { client_id = SID, params = {
+    token = client.INIT_TOKEN, value = { kind = 'end', title = 'Initializing server' },
+  } } })
+  check('starting: gone once the server reports, so the session can go idle', status.is_idle(SID))
+
+  status.reset(SID)
+  fake.initialized = true
+  count = #echoes
+  status.starting(SID)
+  check('starting: an initialized client is left alone', status.get(SID) == nil and #echoes == count)
+
+  status.teardown_autocmds()
+  status.reset(SID)
+  vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify = real_get, real_echo, real_notify
+end
+
 -- Neovim 0.11: `nvim_echo` rejects `kind = 'progress'` ("invalid key: kind"), and the pcall around it
 -- swallowed every report, so a whole import went by with nothing on screen. The fallback is a plain
 -- echo, coalesced so that a burst of reports is one echo and never stacks into the hit-enter prompt.
