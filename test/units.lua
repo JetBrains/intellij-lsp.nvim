@@ -1907,6 +1907,74 @@ do
   vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify = real_get, real_echo, real_notify
 end
 
+-- Neovim 0.11: `nvim_echo` rejects `kind = 'progress'` ("invalid key: kind"), and the pcall around it
+-- swallowed every report, so a whole import went by with nothing on screen. The fallback is a plain
+-- echo, coalesced so that a burst of reports is one echo and never stacks into the hit-enter prompt.
+do
+  local progress_mod = require('intellij-lsp.progress')
+  local SID = 4344
+  local real_get, real_echo, real_notify = vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify
+  local real_flag = status._progress_messages
+  local echoes, notes = {}, {}
+  status._progress_messages = false
+  vim.lsp.get_client_by_id = function(id) return id == SID and { name = client.NAME } or nil end
+  vim.api.nvim_echo = function(chunks, history, opts)
+    if next(opts or {}) ~= nil then error('invalid key: kind') end
+    table.insert(echoes, { text = chunks[1][1], history = history })
+  end
+  vim.notify = function(msg) table.insert(notes, msg) end
+  status.setup_autocmds()
+  local function fire(kind, message, percentage)
+    vim.api.nvim_exec_autocmds('LspProgress', { data = { client_id = SID, params = {
+      token = 'l1', value = { kind = kind, title = 'Indexing', message = message, percentage = percentage },
+    } } })
+  end
+  local function settle() vim.wait(300, function() return false end) end
+
+  check('0.11 line: title and percent spelled out', status._legacy_line('Indexing', 47) == 'IntelliJ LSP: 47% Indexing',
+    status._legacy_line('Indexing', 47))
+  check('0.11 line: no percent, no number', status._legacy_line('Importing: Maven') == 'IntelliJ LSP: Importing: Maven')
+
+  fire('begin'); fire('report', '10%', 10); fire('report', '47%', 47)
+  settle()
+  check('0.11: a burst of reports is one echo', #echoes == 1, vim.inspect(echoes))
+  check('0.11: the echo is the latest report', echoes[1] and echoes[1].text == 'IntelliJ LSP: 47% Indexing',
+    vim.inspect(echoes[1]))
+  check('0.11: kept out of :messages', echoes[1] and echoes[1].history == false)
+  check('0.11: the line counts as open', status.get(SID).msg_id ~= nil)
+
+  fire('end'); fire('begin'); fire('report', '90%', 90)
+  progress_mod.handlers()['intellij/ready-for-test'](nil, nil, { client_id = SID })
+  settle()
+  check('0.11: ready closes the line', status.get(SID).msg_id == nil)
+  check('0.11: the ready notification is the last word', #echoes == 1 and notes[#notes] == 'IntelliJ LSP: indexing complete',
+    vim.inspect({ echoes = echoes, notes = notes }))
+
+  fire('end'); fire('begin'); fire('report', '0%', 0); fire('end')
+  settle()
+  check('0.11: a post-ready round closes with Ready', echoes[#echoes].text == 'IntelliJ LSP: Ready',
+    vim.inspect(echoes[#echoes]))
+  check('0.11: and only Ready', #echoes == 2, #echoes)
+
+  status.teardown_autocmds()
+  status.reset(SID)
+  progress_mod.reset(SID)
+  status._progress_messages = real_flag
+  vim.lsp.get_client_by_id, vim.api.nvim_echo, vim.notify = real_get, real_echo, real_notify
+end
+
+-- SIGKILL from outside is nearly always the OOM killer; Neovim's own exit message only names the signal.
+check('killed: no message for a normal exit', client._killed_message(nil, 1400) == nil)
+check('killed: no message for SIGTERM', client._killed_message(15, 1400) == nil)
+local killed = client._killed_message(9, 1434)
+check('killed: names the likely cause', killed and killed:find('running out of memory', 1, true) ~= nil, killed)
+check('killed: reports what is free', killed and killed:find('(1.4 GB available without it)', 1, true) ~= nil, killed)
+check('killed: no figure when unknown', not client._killed_message(9, nil):find('available', 1, true))
+check('meminfo: MemAvailable in MiB',
+  client._mem_available_mib('MemTotal:        3905896 kB\nMemAvailable:    1480204 kB\n') == 1445,
+  client._mem_available_mib('MemTotal:        3905896 kB\nMemAvailable:    1480204 kB\n'))
+check('meminfo: missing line is nil', client._mem_available_mib('MemTotal: 1 kB\n') == nil)
+
 -- Server download: platform mapping, the published bundle table, and archive kinds. Pure, no network.
 local server_download = require('intellij-lsp.server_download')
 local bundles = require('intellij-lsp.server_bundles')

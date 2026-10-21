@@ -2,7 +2,8 @@
 
 A Neovim client for the `intellij-server` bundle: indexing, navigation, diagnostics, completion,
 quick fixes and refactorings, type and call hierarchy, formatting, file templates, run/debug and
-git for Java and Kotlin from a single server. Requires Neovim 0.11+.
+git for Java and Kotlin from a single server. Requires Neovim 0.11+ and about 2 GB of free memory
+for the server, more while a Maven or Gradle import runs beside it.
 
 The plugin itself is Apache 2.0 licensed. The `intellij-server` bundle it downloads is a separate
 JetBrains product with its own license (`EULA.txt` inside the bundle), which the plugin asks you to

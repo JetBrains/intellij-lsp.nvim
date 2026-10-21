@@ -36,6 +36,12 @@
 --- `Importing: Maven` can sit unchanged for minutes while the build tool works and a static line
 --- there reads as a hang. The percentage frames are left alone -- a ticking number already says the
 --- same thing, and better. The timer runs only while such a frame is on screen; see `sync_dots`.
+---
+--- Neovim 0.11 has no in-place message: `nvim_echo` rejects `kind = 'progress'` outright ("invalid
+--- key: kind"). There the line is a plain `nvim_echo` without history, which overwrites the message
+--- area as long as only one lands between redraws -- two in a row stack up and raise the hit-enter
+--- prompt. So on 0.11 every echo goes through a short coalescing delay (`legacy_echo`), and Neovim's
+--- own rendering of `title` and `percent` is done by hand. See `M._progress_messages`.
 
 local M = {}
 
@@ -50,7 +56,8 @@ local M = {}
 --- @field percent integer|nil
 --- @field tokens  table<string|integer, IntellijLspToken>
 --- @field rank    integer|nil  highest phase rank reached; startup never moves backwards
---- @field msg_id  integer|nil  the in-place progress message being updated
+--- @field msg_id  integer|true|nil  the in-place progress message being updated; `true` on 0.11,
+---                                 where the line is open but has no id
 
 --- @type table<integer, IntellijLspClientStatus>
 local by_client = {}
@@ -79,6 +86,17 @@ local DOT_FRAMES = 3
 --- motion. Also far slower than the server's report rate, so the animation never competes with a
 --- real update for the message line -- a report simply lands on whichever frame is current.
 local DOT_INTERVAL_MS = 400
+
+--- Whether `nvim_echo` supports in-place progress messages (`kind = 'progress'`, Neovim 0.12).
+---
+--- Probed by feature rather than by version, and exported so test/units.lua can drive the 0.11 path
+--- on a newer Neovim. Without this check every report on 0.11 fails inside its `pcall`, and the
+--- whole import goes by with nothing on screen.
+M._progress_messages = vim.fn.has('nvim-0.12') == 1
+
+--- How long 0.11 echoes are held back so that a burst of reports becomes one echo. Short enough that
+--- the line still reads as live; long enough that Neovim redraws between two of them.
+local LEGACY_COALESCE_MS = 100
 
 -- ---------------------------------------------------------------------------
 -- Pure core. No LSP session, no echoing -- all of this is driven directly by
@@ -250,6 +268,39 @@ local dot_timer = nil
 --- instead of spin.
 local dot_frame = 1
 
+--- The 0.11 line: what 0.12 draws from `title`, `percent` and the text, spelled out by hand.
+--- @param text string
+--- @param percent integer|nil
+--- @return string
+function M._legacy_line(text, percent)
+  return TITLE .. ': ' .. (percent and (percent .. '% ') or '') .. text
+end
+
+--- The line waiting for `legacy_echo`'s timer, or nil when nothing is pending.
+--- @type string|nil
+local legacy_pending = nil
+
+--- Echoes `line` on 0.11, after `LEGACY_COALESCE_MS`, unless a later line replaces it first.
+---
+--- Cut to `v:echospace`, because a line that wraps is two lines, and two lines in a one-line message
+--- area is the hit-enter prompt this whole path exists to avoid.
+--- @param line string|nil nil cancels a pending echo
+function M._legacy_echo(line)
+  local scheduled = legacy_pending ~= nil
+  legacy_pending = line
+  if scheduled or line == nil then return end
+  vim.defer_fn(function()
+    local text = legacy_pending
+    legacy_pending = nil
+    if not text then return end
+    local space = vim.v.echospace
+    if space > 1 and vim.fn.strdisplaywidth(text) > space then
+      text = vim.fn.strcharpart(text, 0, space - 1) .. '…'
+    end
+    pcall(vim.api.nvim_echo, { { text } }, false, {})
+  end, LEGACY_COALESCE_MS)
+end
+
 --- Creates or updates the client's single in-place progress message.
 --- @param client_id integer
 local function report(client_id)
@@ -261,6 +312,12 @@ local function report(client_id)
   -- Decorated here, at the echo, and nowhere else: `st` keeps the server's own wording, so nothing
   -- that reads the state ever sees a dot.
   text = M.animate(text, percent, dot_frame)
+
+  if not M._progress_messages then
+    st.msg_id = true
+    M._legacy_echo(M._legacy_line(text, percent))
+    return
+  end
 
   -- Reusing `st.msg_id` is what makes this update one line instead of appending another.
   local opts = {
@@ -357,11 +414,23 @@ end
 --- text comes from `describe` and never passes through `M.animate`. "Ready ..." would claim work is
 --- still running after the index was flushed, so a refactor that routes this through the decoration
 --- is a bug -- test/units.lua pins it.
+---
+--- On 0.11 the closing frame is echoed only when it says something nothing else does. A client that
+--- stopped has no final text to give, and at `ready-for-test` progress.lua's notification is already
+--- the last word; a "Ready" echo right behind it would stack under it and raise the hit-enter prompt.
 --- @param client_id integer
 --- @param final string|nil text for the closing frame; omitted leaves the last text in place
-local function finish(client_id, final)
+--- @param announced boolean|nil another message already reports the completion
+local function finish(client_id, final, announced)
   local st = by_client[client_id]
   if not st or not st.msg_id then return end
+
+  if not M._progress_messages then
+    M._legacy_echo(final and not announced and M._legacy_line(final) or nil)
+    st.msg_id = nil
+    sync_dots()
+    return
+  end
 
   local text = final or select(1, M.describe(st)) or ''
   pcall(vim.api.nvim_echo, { { text } }, false, {
@@ -445,7 +514,7 @@ function M.setup_autocmds()
   -- the indexing bar reaching 100%. It also matches `progress.is_ready`, the name this state
   -- already has in the code.
   require('intellij-lsp.progress').on_ready(function(client_id)
-    finish(client_id, 'Ready')
+    finish(client_id, 'Ready', true)
   end)
 end
 

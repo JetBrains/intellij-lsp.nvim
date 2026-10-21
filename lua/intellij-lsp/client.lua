@@ -723,6 +723,43 @@ local function last_severe_from_log(system_path)
   return M._last_severe(tail)
 end
 
+--- MemAvailable from `/proc/meminfo` text, in MiB, or nil when the text has no such line.
+--- @param meminfo string|nil
+--- @return integer|nil
+function M._mem_available_mib(meminfo)
+  local kib = meminfo and meminfo:match('MemAvailable:%s*(%d+)%s*kB')
+  return kib and math.floor(tonumber(kib) / 1024) or nil
+end
+
+--- Why the server died of SIGKILL, in words, or nil for any other way of exiting.
+---
+--- Neovim's own "quit with exit code 0 and signal 9" names the signal and nothing else. This plugin
+--- never sends SIGKILL -- `stop(true)` is SIGTERM -- so a 9 came from outside, and on a desktop or a
+--- small VM that is nearly always the kernel's out-of-memory killer. The server's heap alone may
+--- grow to 2 GB (`-Xmx2048m` in its vmoptions), and a Maven or Gradle import runs the build tool's
+--- own JVM beside it, so a machine with less than that free loses the server partway through the
+--- first import -- which is also why the indexing messages stop without a "Ready".
+--- @param signal integer|nil
+--- @param available_mib integer|nil memory available now that the server is gone -- the room a
+---                                  restart would have; nil leaves it out
+--- @return string|nil
+function M._killed_message(signal, available_mib)
+  if signal ~= 9 then return nil end
+  local free = available_mib and (' (%.1f GB available without it)'):format(available_mib / 1024) or ''
+  return 'IntelliJ LSP: the server was killed (signal 9), most likely by the system running out of '
+    .. 'memory' .. free .. '. It needs about 2 GB on its own, plus the Maven or Gradle import. '
+    .. 'Free up memory or add swap, then run :IntellijLspRestart.'
+end
+
+--- @return integer|nil
+local function mem_available_mib()
+  local f = io.open('/proc/meminfo', 'r')
+  if not f then return nil end
+  local text = f:read('*a')
+  f:close()
+  return M._mem_available_mib(text)
+end
+
 --- Stops a client whose `initialize` failed and says why.
 ---
 --- Neovim itself cannot report this. Its `initialize` callback asserts on the error, but the
@@ -964,7 +1001,7 @@ function M.config(root_dir, cfg, consent)
       end
     end,
 
-    on_exit = function(code, _, client_id)
+    on_exit = function(code, signal, client_id)
       progress.reset(client_id)
       versions.reset(client_id)
       licensing.reset(client_id)
@@ -993,6 +1030,10 @@ function M.config(root_dir, cfg, consent)
       elseif code == 12 then
         vim.schedule(function()
           require('intellij-lsp.consent').bundle_corrupted(cfg.server_path, require('intellij-lsp').reinstall)
+        end)
+      elseif signal == 9 and vim.v.exiting == vim.NIL then
+        vim.schedule(function()
+          vim.notify(M._killed_message(signal, mem_available_mib()), vim.log.levels.ERROR)
         end)
       end
     end,

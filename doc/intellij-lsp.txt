@@ -21,7 +21,8 @@ A thin Neovim client for the `intellij-server` bundle. It gives Java and
 Kotlin indexing, navigation, diagnostics, completion, running and debugging
 from a single server.
 
-Requires Neovim 0.11+.
+Requires Neovim 0.11+, and about 2 GB of free memory for the server (more while
+a Maven or Gradle import runs beside it).
 
 See |README.md| in this plugin's directory for the full manual, including
 extended rationale for each behaviour. This help file covers setup,
