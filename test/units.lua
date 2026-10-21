@@ -3517,11 +3517,11 @@ vim.fn.writefile({
 vim.fn.setfperm(launcher, 'rwxr-xr-x')
 signin.remote = function() return false end
 opened, copied, notified = {}, {}, {}
-local function run_terminal(code)
+local function run_terminal(code, submit)
   local job = signin.terminal_login(launcher, vim.tbl_extend('force', vim.fn.environ(), { MARK = 'm1' }))
   local buf = vim.api.nvim_get_current_buf()
   vim.wait(3000, function() return #copied > 0 end, 20)
-  vim.fn.chansend(job, code .. '\n')
+  if submit then submit(job, code) else vim.fn.chansend(job, code .. '\n') end
   vim.fn.jobwait({ job }, 3000)
   vim.wait(1000, function()
     local msg = (notified[#notified] or {}).msg or ''
@@ -3540,8 +3540,21 @@ buf = run_terminal('bad')
 check('terminal: a failure keeps the split open', vim.api.nvim_buf_is_valid(buf)
   and table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n'):find('args: license login --code', 1, true)
   and notified[#notified].level == vim.log.levels.WARN, vim.inspect(notified))
+check('terminal: a failure leaves Terminal mode, so a key does not close the reason',
+  vim.api.nvim_get_mode().mode ~= 't', vim.api.nvim_get_mode().mode)
 vim.cmd('stopinsert')
 pcall(vim.api.nvim_buf_delete, buf, { force = true })
+-- A click in the split leaves Terminal mode; the paste still reaches the prompt, and Enter in Normal
+-- mode used to only move the cursor while the CLI waited on.
+opened, copied, notified = {}, {}, {}
+buf = run_terminal('good', function(job, code)
+  vim.fn.chansend(job, code)
+  vim.cmd('stopinsert')
+  vim.api.nvim_feedkeys(vim.keycode('<CR>'), 'x', false)
+end)
+check('terminal: Enter in Normal mode submits the code', not vim.api.nvim_buf_is_valid(buf)
+  and notified[#notified].msg:find('signed in', 1, true), vim.inspect(notified))
+vim.cmd('stopinsert')
 vim.fn.delete(dir, 'rf')
 
 -- :IntellijLspLicense completion

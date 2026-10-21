@@ -260,6 +260,10 @@ function M.terminal_login(launcher, env, opts)
           pcall(vim.api.nvim_win_close, win, true)
           notify('signed in. Every running server picks up the license within seconds.')
         else
+          -- Out of Terminal mode, where the next key would close the split and the reason with it.
+          if vim.api.nvim_get_current_buf() == buf and vim.api.nvim_get_mode().mode == 't' then
+            vim.cmd('stopinsert')
+          end
           notify('the sign-in did not complete; the terminal says why.', WARN)
         end
       end)
@@ -270,6 +274,16 @@ function M.terminal_login(launcher, env, opts)
     notify('could not run ' .. launcher .. '.', WARN)
     return nil
   end
+  -- Enter submits from Normal mode too. Any mouse click, drag or scroll in the split -- selecting
+  -- the link to copy it, say -- leaves Terminal mode, and a paste there still reaches the prompt,
+  -- so the code is typed in but Enter only moves the cursor while the CLI goes on waiting. Once the
+  -- CLI has exited, Enter is left alone: Terminal mode on a finished job closes the split at the
+  -- next key, along with the reason it printed.
+  vim.keymap.set('n', '<CR>', function()
+    if vim.fn.jobwait({ job }, 0)[1] ~= -1 then return end
+    vim.fn.chansend(job, '\r')
+    vim.cmd('startinsert')
+  end, { buffer = buf, nowait = true, desc = 'Submit the authorization code' })
   vim.cmd('startinsert')
   return job
 end
