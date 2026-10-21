@@ -3,10 +3,6 @@
 --   nvim --headless -u NONE -l test/theme.lua
 vim.opt.runtimepath:prepend(vim.fs.dirname(vim.fs.dirname(debug.getinfo(1, 'S').source:sub(2))))
 
--- Every assertion below compares 24-bit hex, which nvim_get_hl only reports when termguicolors is
--- on; without it the checks would all fail for the wrong reason.
-vim.opt.termguicolors = true
-
 local failures = 0
 local function check(name, cond, detail)
   if cond then
@@ -17,7 +13,16 @@ local function check(name, cond, detail)
   end
 end
 
+-- The scheme turns termguicolors on itself when the user never touched it. Pin a truecolor-capable
+-- terminal so the check doesn't depend on the shell this runs from. Every assertion below compares
+-- 24-bit hex, which nvim_get_hl only reports when termguicolors is on.
+vim.env.TERM, vim.env.TERM_PROGRAM = 'xterm-256color', nil
+local notified = {}
+local notify = vim.notify
+vim.notify = function(msg) table.insert(notified, msg) end
 vim.cmd.colorscheme('islands-dark')
+check('termguicolors enabled when unset', vim.o.termguicolors == true)
+check('no termguicolors warning when enabled', #notified == 0, vim.inspect(notified))
 
 --- Resolved attributes of a highlight group. `link = false` follows links, so this reports the
 --- effective colour whether the group was set directly or linked to one that was.
@@ -175,6 +180,14 @@ vim.cmd.colorscheme('default')
 check('ReferenceMatch survives a colorscheme change',
   bg('IntellijLspReferenceMatch') ~= nil, vim.inspect(hl('IntellijLspReferenceMatch')))
 vim.cmd.colorscheme('islands-dark')
+
+-- An explicit `notermguicolors` is the user's call: warn, don't override.
+vim.o.termguicolors = false
+notified = {}
+vim.cmd.colorscheme('islands-dark')
+check('explicit notermguicolors respected', vim.o.termguicolors == false)
+check('explicit notermguicolors warns', #notified == 1, vim.inspect(notified))
+vim.notify = notify
 
 print(failures == 0 and '\nALL THEME CHECKS PASSED' or ('\n' .. failures .. ' THEME CHECK(S) FAILED'))
 vim.cmd(failures == 0 and 'qa!' or 'cq!')

@@ -492,8 +492,9 @@ rename_files
 
 colorscheme
     Apply the bundled `islands-dark` scheme, unless a colorscheme is
-    already in effect when `setup()` runs. Needs 'termguicolors'.
-    Default: true.
+    already in effect when `setup()` runs. Turns on 'termguicolors'
+    unless you set it yourself, or the terminal is the Linux console or
+    Apple Terminal; there it only warns. Default: true.
 
 nowrap
     Set 'nowrap', so a long line scrolls right instead of wrapping,

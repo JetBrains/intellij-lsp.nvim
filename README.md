@@ -143,7 +143,7 @@ require('intellij-lsp').setup({
   intellij_extensions = true,     -- opt into the intellij/ protocol extensions: lazy quick fixes, variants, conflicts
   decompiler = true,              -- open jar:/jrt: URIs as decompiled source
   rename_files = false,           -- register :IntellijLspRename {path}
-  colorscheme = true,             -- apply the bundled islands-dark scheme unless you set your own (needs termguicolors)
+  colorscheme = true,             -- apply the bundled islands-dark scheme unless you set your own (turns on termguicolors)
   nowrap = false,                 -- set 'nowrap' like IntelliJ's default
 
   -- Messages ----------------------------------------------------------------

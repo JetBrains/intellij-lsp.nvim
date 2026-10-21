@@ -15,6 +15,23 @@ local M = {}
 
 M.NAME = 'islands-dark'
 
+--- Whether apply() may turn 'termguicolors' on by itself.
+---
+--- Neovim already enables it when the terminal advertises truecolor (COLORTERM or an XTGETTCAP
+--- reply), but that detection misses plenty of capable terminals: COLORTERM is routinely dropped
+--- over ssh, through sudo and inside tmux. So off-by-default is not evidence the terminal can't do
+--- it. Two cases are left alone:
+---
+---   * the user set it themselves (`was_set`), which here can only mean they turned it off;
+---   * terminals known to garble 24-bit escapes: the Linux console, and Apple Terminal before
+---     macOS 26, which can't be told apart from later versions by TERM_PROGRAM alone.
+local function can_force_termguicolors()
+  if vim.api.nvim_get_option_info2('termguicolors', {}).was_set then return false end
+  if vim.env.TERM == 'linux' then return false end
+  if vim.env.TERM_PROGRAM == 'Apple_Terminal' then return false end
+  return true
+end
+
 --- Applies the Islands Dark highlight groups to the current session.
 ---
 --- Order matters here. `hi clear` has to run before the new groups are set, and `syntax reset` only
@@ -38,13 +55,15 @@ function M.apply()
 
   -- Every colour in the palette is a 24-bit hex literal. Without termguicolors the terminal
   -- quantizes them to the nearest of 256 palette entries and the result looks nothing like the IDE.
-  -- Warned rather than forced: flipping a global terminal option on the user's behalf can break
-  -- terminals that do not support truecolor.
   if not vim.o.termguicolors then
-    vim.notify(
-      'IntelliJ LSP: islands-dark needs `termguicolors`; set `vim.opt.termguicolors = true`.',
-      vim.log.levels.WARN
-    )
+    if can_force_termguicolors() then
+      vim.o.termguicolors = true
+    else
+      vim.notify(
+        'IntelliJ LSP: islands-dark needs `termguicolors`; set `vim.opt.termguicolors = true`.',
+        vim.log.levels.WARN
+      )
+    end
   end
 
   for name, opts in pairs(groups.build(palette)) do
