@@ -72,15 +72,39 @@ local function bundle_for_this_platform()
   return bundles.bundle(os, arch)
 end
 
+--- Commands that print a file's SHA-256 as the first run of 64 hex digits in their output.
+local SHA256_COMMANDS = {
+  { 'sha256sum', '--' },
+  { 'shasum', '-a', '256', '--' },
+  { 'certutil', '-hashfile' },
+}
+
 --- SHA-256 of a file's contents, lowercase hex.
+--- Hashed by an external tool: `vim.fn.sha256` takes the binary contents as a Blob, which Neovim
+--- 0.11 rejects (E976), and reading the archive into Lua would hold all of it in memory.
 --- @param path string
 --- @return string|nil
 local function sha256_file(path)
+  if vim.fn.filereadable(path) ~= 1 then return nil end
+  for _, base in ipairs(SHA256_COMMANDS) do
+    if vim.fn.executable(base[1]) == 1 then
+      local cmd = vim.list_extend(vim.deepcopy(base), { path })
+      if base[1] == 'certutil' then table.insert(cmd, 'SHA256') end
+      local ok, result = pcall(function() return vim.system(cmd, { text = true }):wait() end)
+      if ok and result.code == 0 then
+        for hex in result.stdout:gmatch('%x+') do
+          if #hex == 64 then return hex:lower() end
+        end
+      end
+    end
+  end
+  -- No usable tool: fine on 0.12+, where `sha256()` accepts a Blob.
   local file = io.open(path, 'rb')
   if not file then return nil end
   local contents = file:read('*a')
   file:close()
-  return vim.fn.sha256(contents):lower()
+  local ok, hex = pcall(vim.fn.sha256, contents)
+  return ok and hex:lower() or nil
 end
 
 --- Extension for the archive named by `url`, one of the formats `extract` knows how to unpack.
