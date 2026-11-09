@@ -137,28 +137,30 @@ end
 
 --- Buffer-local keymaps for the hierarchies and the symbol search.
 ---
---- `<leader>` maps, like `<leader>rr`: there is no built-in mapping to shadow here, so a bare
---- two-letter sequence would claim space in the user's own namespace. The letters follow the
---- feature: `t` type hierarchy, `c` call hierarchy, `w` workspace.
+--- Under the configured prefix (`<leader>` unless `keymaps.prefix` says otherwise), like `<leader>rr`:
+--- there is no built-in mapping to shadow here, so a bare two-letter sequence would claim space in the
+--- user's own namespace. The letters follow the feature: `t` type hierarchy, `c` call hierarchy,
+--- `w` workspace.
 --- @param client vim.lsp.Client
 --- @param bufnr integer
 --- @param cfg table
 function M.setup_keymaps(client, bufnr, cfg)
-  if cfg.keymaps == false then return end
-  local function map(lhs, rhs, desc)
-    vim.keymap.set('n', lhs, rhs, { buffer = bufnr, desc = 'IntelliJ: ' .. desc })
+  local prefix = require('intellij-lsp.keymaps').prefix(cfg)
+  if not prefix then return end
+  local function map(suffix, rhs, desc)
+    vim.keymap.set('n', prefix .. suffix, rhs, { buffer = bufnr, desc = 'IntelliJ: ' .. desc })
   end
 
   if client:supports_method('textDocument/prepareTypeHierarchy') then
-    map('<leader>ts', function() M.type_hierarchy('subtypes') end, 'type hierarchy, subtypes')
-    map('<leader>tu', function() M.type_hierarchy('supertypes') end, 'type hierarchy, supertypes')
+    map('ts', function() M.type_hierarchy('subtypes') end, 'type hierarchy, subtypes')
+    map('tu', function() M.type_hierarchy('supertypes') end, 'type hierarchy, supertypes')
   end
   if client:supports_method('textDocument/prepareCallHierarchy') then
-    map('<leader>ci', function() M.call_hierarchy('incoming') end, 'call hierarchy, incoming calls')
-    map('<leader>co', function() M.call_hierarchy('outgoing') end, 'call hierarchy, outgoing calls')
+    map('ci', function() M.call_hierarchy('incoming') end, 'call hierarchy, incoming calls')
+    map('co', function() M.call_hierarchy('outgoing') end, 'call hierarchy, outgoing calls')
   end
   if client:supports_method('workspace/symbol') then
-    map('<leader>ws', function() M.workspace_symbol() end, 'search workspace symbols')
+    map('ws', function() M.workspace_symbol() end, 'search workspace symbols')
   end
 end
 

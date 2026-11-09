@@ -69,9 +69,12 @@ local M = {}
 --- @field signature_help boolean|nil
 ---                                 open the parameter popup when typing `(` or `,` inside a call
 ---                                 (default true); <C-S> in insert mode still works either way
---- @field keymaps boolean|nil      install the buffer-local <leader> maps for type and call
----                                 hierarchy and workspace symbol search (default true); the
----                                 `:IntellijLsp*` commands exist either way
+--- @field keymaps boolean|{ prefix: string }|nil
+---                                 install the buffer-local maps for type and call hierarchy,
+---                                 workspace symbols, running and debugging (default true, under
+---                                 `<leader>`); `{ prefix = '<localleader>' }` moves them all under
+---                                 another prefix, false installs none of them; the `:IntellijLsp*`
+---                                 commands and code lenses work either way
 --- @field format_on_save boolean|nil
 ---                                 format the whole buffer with IntelliJ's formatter before every
 ---                                 write (default false); `:IntellijLspFormat` does it by hand
@@ -777,6 +780,13 @@ function M.setup(opts)
   -- A value the server does not know would fail every launch. Dropped instead, so the consent screen
   -- asks for it, and reported once per setup() call.
   local problems = consent.validate(M.config)
+  -- A broken `keymaps` table would otherwise map under a garbage prefix on every buffer, or throw from
+  -- on_attach. Falls back to the default prefix, so the maps stay where the README says they are.
+  local keymap_problem = require('intellij-lsp.keymaps').validate(M.config.keymaps)
+  if keymap_problem then
+    table.insert(problems, keymap_problem)
+    M.config.keymaps = true
+  end
   if #problems > 0 then
     vim.notify('IntelliJ LSP: ignoring invalid options:\n  ' .. table.concat(problems, '\n  '),
       vim.log.levels.ERROR)

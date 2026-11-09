@@ -50,7 +50,9 @@ local function suspended_session()
   end
   local session = dap.session()
   if not session then
-    vim.notify('IntelliJ LSP: no debug session. Start one with <leader>rd.', vim.log.levels.WARN)
+    local rd = require('intellij-lsp.keymaps').lhs('rd')
+    vim.notify('IntelliJ LSP: no debug session. Start one with '
+      .. (rd and (rd .. ' or ') or '') .. 'the Debug code lens above `main`.', vim.log.levels.WARN)
     return nil
   end
   if not session.stopped_thread_id then
@@ -961,24 +963,26 @@ function M.open()
 end
 
 --- @param bufnr integer
-function M.set_keymaps(bufnr)
-  local function map(lhs, rhs, desc, modes)
-    vim.keymap.set(modes or 'n', lhs, rhs, { buffer = bufnr, desc = desc })
+--- @param prefix string|nil what the maps hang off, e.g. `<leader>` (the default) or `<localleader>`
+function M.set_keymaps(bufnr, prefix)
+  prefix = prefix or require('intellij-lsp.keymaps').DEFAULT_PREFIX
+  local function map(suffix, rhs, desc, modes)
+    vim.keymap.set(modes or 'n', prefix .. suffix, rhs, { buffer = bufnr, desc = desc })
   end
 
-  map('<leader>b', M.toggle_breakpoint, 'IntelliJ: toggle a breakpoint')
-  map('<leader>B', M.toggle_conditional_breakpoint, 'IntelliJ: breakpoint with a condition')
-  map('<leader>rd', function() require('intellij-lsp.run').run_at_cursor(false) end, 'IntelliJ: debug the class at the cursor')
-  map('<leader>dc', M.continue, 'IntelliJ: continue')
-  map('<leader>dn', M.step_over, 'IntelliJ: step over')
-  map('<leader>di', M.step_into, 'IntelliJ: step into')
-  map('<leader>do', M.step_out, 'IntelliJ: step out')
-  map('<leader>dq', M.stop, 'IntelliJ: stop the debug session')
+  map('b', M.toggle_breakpoint, 'IntelliJ: toggle a breakpoint')
+  map('B', M.toggle_conditional_breakpoint, 'IntelliJ: breakpoint with a condition')
+  map('rd', function() require('intellij-lsp.run').run_at_cursor(false) end, 'IntelliJ: debug the class at the cursor')
+  map('dc', M.continue, 'IntelliJ: continue')
+  map('dn', M.step_over, 'IntelliJ: step over')
+  map('di', M.step_into, 'IntelliJ: step into')
+  map('do', M.step_out, 'IntelliJ: step out')
+  map('dq', M.stop, 'IntelliJ: stop the debug session')
   -- Also in Visual mode, where expression_for_evaluate takes the selection. Without the `x` map the
   -- `d` of the lhs falls through to Vim's own delete and removes the selected text.
-  map('<leader>de', M.evaluate_at_cursor, 'IntelliJ: evaluate the expression at the cursor', { 'n', 'x' })
-  map('<leader>dw', M.watch_at_cursor, 'IntelliJ: watch the expression at the cursor', { 'n', 'x' })
-  map('<leader>dv', M.open, 'IntelliJ: open the debug panel (call stack, locals, watches)')
+  map('de', M.evaluate_at_cursor, 'IntelliJ: evaluate the expression at the cursor', { 'n', 'x' })
+  map('dw', M.watch_at_cursor, 'IntelliJ: watch the expression at the cursor', { 'n', 'x' })
+  map('dv', M.open, 'IntelliJ: open the debug panel (call stack, locals, watches)')
 end
 
 --- Recolors nvim-dap's breakpoint signs to IntelliJ's breakpoint-line colour.

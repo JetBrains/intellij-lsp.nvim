@@ -457,10 +457,15 @@ signature_help
     Open the parameter popup when typing `(` or `,` inside a call. <C-S>
     in insert mode works either way. Default: true.
 
-keymaps
-    Install the buffer-local <leader> maps for type and call hierarchy
-    and workspace symbol search (see |intellij-lsp-navigation|). The
-    commands exist either way. Default: true.
+keymaps                                                 *intellij-lsp-keymaps*
+    Install the buffer-local <leader> maps for type and call hierarchy,
+    workspace symbol search, running and debugging (see
+    |intellij-lsp-navigation| and |intellij-lsp-run-debug|). A table moves
+    all of them under another prefix, for when they clash with your own
+    <leader> maps: >lua
+        keymaps = { prefix = '<localleader>' },
+<   false installs none of them. The commands and code lenses work either
+    way. Default: true.
 
 format_on_save
     Format the whole buffer with IntelliJ's formatter before every write.
@@ -595,7 +600,9 @@ all work. On top of them, in a Java or Kotlin buffer:
     <leader>co    call hierarchy: what the method at the cursor calls
     <leader>ws    search workspace symbols (prompts for a query)
 
-Set `keymaps = false` to keep these off and use the commands instead.
+Set `keymaps = { prefix = '<localleader>' }` to move these (and the run and
+debug maps) off <leader>, or `keymaps = false` to keep them off and use the
+commands instead; see |intellij-lsp-keymaps|.
 
 Typing `(` or `,` inside a call opens the parameter popup
 (`signature_help`). After 'updatetime' with the cursor still, every
@@ -632,6 +639,9 @@ https://github.com/mfussenegger/nvim-dap.
     <leader>dq    stop the session
     <leader>de    evaluate the expression at the cursor
     <leader>dw    watch the expression at the cursor
+
+These follow `keymaps` like the navigation maps: another prefix moves them,
+false removes them and leaves the Run / Debug code lenses.
 
 Program output and the build tool's import output (Maven's or Gradle's
 console) share one bottom panel. `build_output` in setup() decides when

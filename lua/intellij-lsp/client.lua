@@ -980,23 +980,27 @@ function M.config(root_dir, cfg, consent)
       if cfg.run ~= false and client:supports_method('textDocument/codeLens') then
         M.setup_codelens(bufnr)
 
-        -- `<leader>` rather than a bare key: unlike `grr` there is no built-in mapping here to
-        -- shadow, so this must not claim a two-letter sequence in the user's namespace.
-        vim.keymap.set('n', '<leader>rr', function() require('intellij-lsp.run').run_at_cursor() end, {
-          buffer = bufnr,
-          desc = 'IntelliJ: run the main class at the cursor',
-        })
-        vim.keymap.set('n', '<leader>rl', function() vim.lsp.codelens.run() end, {
-          buffer = bufnr,
-          desc = 'IntelliJ: run the code lens on this line',
-        })
+        -- Under a prefix (`<leader>` by default) rather than a bare key: unlike `grr` there is no
+        -- built-in mapping here to shadow, so this must not claim a two-letter sequence in the user's
+        -- namespace. `keymaps = false` leaves only `:IntellijLspRun` and the code lenses.
+        local prefix = require('intellij-lsp.keymaps').prefix(cfg)
+        if prefix then
+          vim.keymap.set('n', prefix .. 'rr', function() require('intellij-lsp.run').run_at_cursor() end, {
+            buffer = bufnr,
+            desc = 'IntelliJ: run the main class at the cursor',
+          })
+          vim.keymap.set('n', prefix .. 'rl', function() vim.lsp.codelens.run() end, {
+            buffer = bufnr,
+            desc = 'IntelliJ: run the code lens on this line',
+          })
+        end
 
         -- Nested under the `run` check rather than beside it: debugging is the same launch path with
         -- `noDebug` flipped, so with running disabled there is no adapter for these to drive. The
         -- breakpoint maps come along with the stepping maps because a breakpoint you cannot reach is
         -- worse than no keymap at all.
-        if cfg.debug ~= false then
-          require('intellij-lsp.debug').set_keymaps(bufnr)
+        if prefix and cfg.debug ~= false then
+          require('intellij-lsp.debug').set_keymaps(bufnr, prefix)
         end
       end
     end,

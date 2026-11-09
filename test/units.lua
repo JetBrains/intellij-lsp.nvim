@@ -2598,6 +2598,24 @@ else
   vim.bo[plain].filetype = 'java'
   editor.setup_keymaps(ed_client, plain, { keymaps = false })
   check('keymaps = false installs nothing', #vim.api.nvim_buf_get_keymap(plain, 'n') == 0)
+
+  -- `keymaps = { prefix = '<localleader>' }` moves every map off `<leader>` (issue #7). Distinct
+  -- leaders so a map left behind under `<leader>` cannot pass for one under `<localleader>`.
+  local saved_leader, saved_local = vim.g.mapleader, vim.g.maplocalleader
+  vim.g.mapleader, vim.g.maplocalleader = '_', ','
+  local local_buf = vim.api.nvim_create_buf(false, true)
+  local localleader_cfg = { keymaps = { prefix = '<localleader>' } }
+  editor.setup_keymaps(ed_client, local_buf, localleader_cfg)
+  require('intellij-lsp.debug').set_keymaps(local_buf, require('intellij-lsp.keymaps').prefix(localleader_cfg))
+  local lhss = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_keymap(local_buf, 'n')) do lhss[m.lhs] = true end
+  check('localleader prefix: hierarchy maps', lhss[',ts'] and lhss[',tu'] and lhss[',ci'] and lhss[',co'] and lhss[',ws'],
+    vim.inspect(vim.tbl_keys(lhss)))
+  check('localleader prefix: debug maps', lhss[',b'] and lhss[',B'] and lhss[',rd'] and lhss[',dc'] and lhss[',dv'],
+    vim.inspect(vim.tbl_keys(lhss)))
+  check('localleader prefix: nothing under <leader>', not vim.iter(vim.tbl_keys(lhss)):any(function(l) return l:sub(1, 1) == '_' end),
+    vim.inspect(vim.tbl_keys(lhss)))
+  vim.g.mapleader, vim.g.maplocalleader = saved_leader, saved_local
   editor.setup_document_highlight(ed_client, plain, { document_highlight = false })
   check('document_highlight = false installs nothing', not (function()
     local ok, cmds = pcall(vim.api.nvim_get_autocmds, { group = 'IntellijLspDocumentHighlight' .. plain })
@@ -2605,6 +2623,20 @@ else
   end)())
 
   vim.lsp.stop_client(ed_id, true)
+end
+
+-- The keymap prefix: default, override, off, and bad values reported rather than mapped.
+do
+  local km = require('intellij-lsp.keymaps')
+  check('keymaps prefix defaults to <leader>', km.prefix({}) == '<leader>' and km.prefix({ keymaps = true }) == '<leader>')
+  check('keymaps prefix override', km.prefix({ keymaps = { prefix = '<localleader>' } }) == '<localleader>')
+  check('keymaps table without prefix keeps <leader>', km.prefix({ keymaps = {} }) == '<leader>')
+  check('keymaps = false has no prefix', km.prefix({ keymaps = false }) == nil and km.lhs('rd', { keymaps = false }) == nil)
+  check('keymaps lhs names the map', km.lhs('rd', { keymaps = { prefix = '<localleader>' } }) == '<localleader>rd')
+  check('keymaps validate accepts good values', km.validate(nil) == nil and km.validate(true) == nil
+    and km.validate(false) == nil and km.validate({ prefix = '<localleader>' }) == nil)
+  check('keymaps validate rejects a string', km.validate('<localleader>') ~= nil)
+  check('keymaps validate rejects an empty prefix', km.validate({ prefix = '' }) ~= nil)
 end
 
 -- The commands exist independently of any attached buffer.

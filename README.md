@@ -138,7 +138,7 @@ require('intellij-lsp').setup({
   folding = true,                 -- fold with the server's folding ranges
   document_highlight = true,      -- highlight the identifier under the cursor after 'updatetime'
   signature_help = true,          -- parameter popup when typing ( or , inside a call
-  keymaps = true,                 -- <leader> maps for type/call hierarchy and symbol search
+  keymaps = true,                 -- <leader> maps for hierarchy, symbols, run and debug; { prefix = '<localleader>' } moves them, false drops them
   format_on_save = false,         -- run IntelliJ's formatter on every write (:IntellijLspFormat by hand)
   file_templates = true,          -- offer IntelliJ file templates for a new, empty .java/.kt file
   intellij_extensions = true,     -- opt into the intellij/ protocol extensions: lazy quick fixes, variants, conflicts
@@ -167,6 +167,15 @@ Then `:checkhealth intellij-lsp`.
 All mappings are buffer-local: the editor mappings exist only in buffers this server serves, the
 panel mappings only inside their panel. Everything else (`gd`, `K`, `gra`, `grn`, `]d`, ...) is
 Neovim's built-in LSP behaviour.
+
+The `<leader>` maps below can move to another prefix if they clash with your own:
+
+```lua
+keymaps = { prefix = '<localleader>' },  -- <localleader>rr, <localleader>ts, <localleader>b, ...
+```
+
+`keymaps = false` installs none of them; the `:IntellijLsp*` commands and the Run / Debug code
+lenses work either way.
 
 ### In a Java or Kotlin buffer
 
