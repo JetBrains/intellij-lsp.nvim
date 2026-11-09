@@ -111,11 +111,10 @@ local M = {}
 ---                                 `<leader>rr`, `:IntellijLspRun` and the server's Run/Debug code
 ---                                 lenses (default true); requires nvim-dap, and the code lenses are
 ---                                 requested from the server only when nvim-dap is installed
---- @field build_before_run boolean|nil
----                                 compile the module with its build tool (`mvn compile`, `gradle
----                                 classes`) before each run or debug launch (default true); false
----                                 launches whatever is already compiled, as `:IntellijLspRun!`
----                                 does for one launch
+--- @field test boolean|nil         run and debug JVM tests: the server's Run Test / Debug Test code
+---                                 lenses, `<leader>rt` / `<leader>dt` for the test at the cursor,
+---                                 `<leader>rT` to rerun, results in the output panel and failures in
+---                                 the quickfix list (default true); needs `run`, and nvim-dap
 
 --- @type IntellijLspConfig
 M.config = {}
@@ -712,7 +711,8 @@ local function finish_setup()
   -- is nothing the commands could do. It must still run before the first attach, because `on_attach`
   -- installs the code-lens refresh and the lens handler registered here is what a click dispatches to.
   if M.config.run then
-    require('intellij-lsp.run').setup({ build_before_run = M.config.build_before_run })
+    require('intellij-lsp.run').setup()
+    if M.config.test then require('intellij-lsp.test').setup() end
   end
 
   -- After `run.setup`, and dependent on it: debugging launches through `run.launch` with `noDebug`
@@ -771,7 +771,7 @@ function M.setup(opts)
     single_key_select = true,
     git = true,
     run = true,
-    build_before_run = true,
+    test = true,
     debug = true,
   }, opts)
   M.config.server_path = expand(M.config.server_path)

@@ -1,13 +1,15 @@
 --- Runs a JVM main class through the language server, with output in the shared bottom panel.
 ---
---- Nothing here resolves a classpath or a JDK itself: `intellij.java.resolveLaunch` composes the
---- whole launch server-side in one round trip, and this module's only job is to call it, hand the
---- answer to nvim-dap, and render the DAP `output` events that follow.
+--- The server runs every program itself (bundle 271 and later). The client sends one DAP `launch`
+--- naming the main class and its source file, and the server works out the rest: the module, its
+--- build tool, the class path and the JDK. The tool builds before it runs (`mvn compile
+--- dependency:build-classpath` and then `java`, Gradle's generated `ideRun` task, ...), and the
+--- build's output arrives as DAP `output` events in the same stream as the program's.
 ---
---- The one thing the server deliberately does *not* do is compile. A launch is a plain `java` on
---- whatever is in the output directory, so before each one this module asks
---- `intellij.java.resolveBuildCommand` for the build tool's own compile invocation and runs it, with
---- its output in the same panel; see "Building before a launch" below.
+--- Bundles up to 263 worked the other way round, through `intellij.java.resolveLaunch` and
+--- `intellij.java.resolveBuildCommand`: the client resolved a class path, ran the build tool itself
+--- and then started a plain `java`. 271 removed both commands; asking for them answers
+--- "Unknown command".
 ---
 --- `has_dap()` gates both this module's own commands and, through `client.lua`'s `runMainCodeLens`
 --- init option, whether the server emits Run/Debug lenses at all: a lens that renders and then fails
@@ -17,10 +19,11 @@ local M = {}
 
 local output = require('intellij-lsp.output')
 
---- The DAP adapter type a plain `java` launch uses. `intellij_gradle` exists for a module a build
---- tool launches instead, which this module does not resolve; nvim-dap here only ever runs the JVM
---- adapter.
+--- The DAP adapter type every launch here uses. The server's JVM adapter answers to
+--- `intellij_gradle` and `intellij_bazel` as well, but the type picks nothing on the server: the
+--- `tool` field of the launch does. One type keeps `owns()` a single comparison.
 local ADAPTER_ID = 'intellij_jvm'
+M.ADAPTER_ID = ADAPTER_ID
 --- The launch configuration field naming the client that resolved the launch; see the adapter.
 local CLIENT_FIELD = 'intellijClientId'
 
@@ -52,6 +55,15 @@ function M._strip_codicons(title)
   return (title:gsub('%$%([%w%-]+%)%s*', ''))
 end
 
+--- Tells `test.lua` a launch never got a session, so a test run it reserved is freed. Only loaded
+--- when something already loaded it: a plain run has no test run to free.
+--- @param config table
+--- @param reason string
+local function launch_failed(config, reason)
+  local test = package.loaded['intellij-lsp.test']
+  if test then test._launch_failed(config, reason) end
+end
+
 --- @type integer|nil
 local dap_registered_for = nil
 
@@ -72,13 +84,16 @@ local function ensure_dap_adapter()
   --
   -- On the server that resolved the launch, which `launch` names in the configuration: with two
   -- projects open, any other one would debug a classpath it never built. A re-run after a server
-  -- restart names a client that is gone; the server covering the working directory takes over.
+  -- restart (`dap.run_last()`) names a client that is gone; the server covering the launch's file
+  -- takes over, or its working directory for a configuration that names one.
   dap.adapters[ADAPTER_ID] = function(callback, config)
     local client_module = require('intellij-lsp.client')
     local c = config[CLIENT_FIELD] and vim.lsp.get_client_by_id(config[CLIENT_FIELD])
+    if not c and config.file then c = client_module.find_ancestor_client(config.file) end
     if not c and config.cwd then c = client_module.find_ancestor_client(config.cwd) end
     if not c then
       vim.notify('IntelliJ LSP: no server running for this launch, cannot start a debug session.', vim.log.levels.ERROR)
+      launch_failed(config, 'no server running for it')
       return
     end
 
@@ -87,10 +102,9 @@ local function ensure_dap_adapter()
       arguments = { vim.uri_from_fname(c.config.root_dir) },
     }, function(err, port)
       if err or not port then
-        vim.notify(
-          'IntelliJ LSP: failed to start the debug server: ' .. tostring(err and (err.message or err)),
-          vim.log.levels.ERROR
-        )
+        local why = 'failed to start the debug server: ' .. tostring(err and (err.message or err))
+        vim.notify('IntelliJ LSP: ' .. why, vim.log.levels.ERROR)
+        vim.schedule(function() launch_failed(config, why) end)
         return
       end
       -- `id` is what nvim-dap sends as the DAP `initialize` request's `adapterID`; without it nvim-dap
@@ -115,257 +129,76 @@ local function ensure_dap_adapter()
   end
 end
 
---- Resolves the full launch (classpath, JDK, working directory, VM args) for `main_class`.
----
---- One `workspace/executeCommand` round trip: the server composes every fragment in a single read
---- action, so there is nothing left here to assemble or to forget a piece of (`resolveClasspath` /
---- `resolveJavaExecutable` / `resolveWorkingDirectory` used to be three separate commands and three
---- separate round trips; the server merged them for exactly that reason).
---- @param client vim.lsp.Client
---- @param uri string
---- @param cb fun(err: table|nil, paths: table|nil)
-local function resolve_launch(client, uri, cb)
-  client:request('workspace/executeCommand', {
-    command = 'intellij.java.resolveLaunch',
-    arguments = { { uri = uri } },
-  }, function(err, result) cb(err, result) end)
-end
-
--- -------------------------------------------------------------------------------------------------
--- Building before a launch
--- -------------------------------------------------------------------------------------------------
-
---- The server compiles nothing itself. `intellij.java.resolveBuildCommand` answers with the build
---- tool's own compile invocation for the module owning a document -- `./mvnw -pl :app -am compile`,
---- `gradlew :app:classes` -- and the client is expected to run it before a plain-JVM launch. Without
---- that, a fresh clone launches straight into `Could not find or load main class`, and an edited
---- class silently runs the previous build. The second is the one that costs an afternoon.
----
---- The price is a build-tool invocation on every launch, even with nothing changed: several seconds
---- of Maven before the first line of program output. There is no cheap way to know that nothing
---- changed (resources, generated sources, a dependency bump), so nothing here tries; the escape hatch
---- is `:IntellijLspRun!`, or `build_before_run = false` to make skipping the default.
-
---- Whether a build precedes each launch. Set from `setup()`.
-local build_before_run = true
-
---- The build in flight, if any. One at a time: a second launch during a build is refused rather than
---- queued, because two builds would race for the same output directory.
---- @type { proc: vim.SystemObj, cancelled: boolean }|nil
-local building = nil
-
---- The build to run for a `resolveBuildCommand` answer, or nil with the server's reason when there is
---- nothing to run.
----
---- A `supported` answer with an empty command also counts as nothing to run: a command that builds
---- nothing would report success while compiling nothing.
---- @param resolved table|nil
---- @return { command: string[], cwd: string|nil, tool: string|nil }|nil build
---- @return string|nil reason the server's user-visible explanation, when it gave one
-function M._build_to_run(resolved)
-  if type(resolved) ~= 'table' then return nil, nil end
-  if resolved.supported == false then return nil, resolved.reason end
-  if type(resolved.command) ~= 'table' or #resolved.command == 0 then return nil, nil end
-  return { command = resolved.command, cwd = resolved.cwd, tool = resolved.tool }, nil
-end
-
---- Same shape as the import log's separators in `progress.lua`, so a build's boundaries are findable
---- the same way in a buffer that also holds program output.
---- @param text string
---- @return string
-local function separator(text)
-  return '--- ' .. text .. ' ---'
-end
-
---- A line-splitting sink for one of the build's streams.
----
---- Chunks arrive at arbitrary boundaries, and the highlight is decided per *line* (a `[ERROR]`
---- prefix, a `BUILD FAILURE` summary), so the trailing partial line is held back until the next
---- chunk completes it. `flush` writes whatever is left when the process exits.
---- @return fun(err: string|nil, data: string|nil) on_data
---- @return fun() flush
-local function line_sink()
-  local hl = require('intellij-lsp.progress')._import_hl
-  local rest = ''
-  local function on_data(_, data)
-    if not data then return end
-    local lines = vim.split(rest .. data, '\n', { plain = true })
-    rest = table.remove(lines)
-    for _, line in ipairs(lines) do output.append(line, hl(nil, line)) end
-  end
-  local function flush()
-    if rest ~= '' then output.append(rest, hl(nil, rest)) end
-    rest = ''
-  end
-  return on_data, flush
-end
-
---- Runs a resolved build with its output streamed into the panel, then calls `cb(ok)`.
----
---- Exit 0 is `ok`. A non-zero exit, or a command that could not be spawned at all (no `mvn` on PATH),
---- is not, and opens the panel *with* focus: the next thing the user does is `<CR>` on the error. A
---- build stopped through `M.stop()` never calls back -- there is no launch to continue to.
---- @param build { command: string[], cwd: string|nil, tool: string|nil }
---- @param cb fun(ok: boolean)
-function M._run_build(build, cb)
-  local progress = require('intellij-lsp.progress')
-  local label = build.tool or 'build tool'
-  local started = vim.uv.now()
-  output.append(separator(('%s: building: %s'):format(label, table.concat(build.command, ' '))), 'Title')
-  output.open({ focus = false })
-
-  local on_stdout, flush_stdout = line_sink()
-  local on_stderr, flush_stderr = line_sink()
-
-  -- `vim.system` raises rather than reporting a spawn failure through the callback.
-  local spawned, proc = pcall(vim.system, build.command, {
-    cwd = build.cwd,
-    text = true,
-    -- The stream callbacks run in libuv's fast context; `output.append` only queues and schedules,
-    -- which is allowed there, but wrapping keeps that from being a rule this module has to remember.
-    stdout = vim.schedule_wrap(on_stdout),
-    stderr = vim.schedule_wrap(on_stderr),
-  }, vim.schedule_wrap(function(result)
-    flush_stdout()
-    flush_stderr()
-    local this = building
-    building = nil
-    local took = progress._elapsed(vim.uv.now() - started)
-    if this and this.cancelled then
-      output.append(separator(label .. ': build stopped'), 'DiagnosticWarn')
-      return
-    end
-    if result.code == 0 then
-      output.append(separator(('%s: build succeeded (%s)'):format(label, took)), 'DiagnosticOk')
-      cb(true)
-    else
-      output.append(separator(('%s: build failed, exit %d (%s)'):format(label, result.code, took)), 'DiagnosticError')
-      output.open()
-      cb(false)
-    end
-  end))
-
-  if not spawned then
-    output.append(separator(label .. ': build failed to start: ' .. tostring(proc)), 'DiagnosticError')
-    output.open()
-    cb(false)
-    return
-  end
-  building = { proc = proc, cancelled = false }
-end
-
---- Compiles the module owning `uri`, then calls `cb(ok)`; `ok` means the launch may proceed.
----
---- Only a build that actually ran and failed stops a launch. A failed *lookup* -- a server error, or
---- a module no registered build tool can compile (a plain JPS project) -- launches whatever is on
---- disk and says so in the panel: a launch the user asked for is not
---- refused because the build could not even be determined.
---- @param client vim.lsp.Client
---- @param uri string
---- @param cb fun(ok: boolean)
-function M._build(client, uri, cb)
-  client:request('workspace/executeCommand', {
-    command = 'intellij.java.resolveBuildCommand',
-    arguments = { { uri = uri } },
-  }, function(err, resolved)
-    vim.schedule(function()
-      if err then
-        output.append(separator('build skipped: ' .. tostring(err.message or err)), 'DiagnosticWarn')
-        return cb(true)
-      end
-      local build, reason = M._build_to_run(resolved)
-      if not build then
-        if reason then output.append(separator('build skipped: ' .. reason), 'DiagnosticWarn') end
-        return cb(true)
-      end
-      M._run_build(build, cb)
-    end)
-  end)
-end
-
 -- -------------------------------------------------------------------------------------------------
 -- Launching
 -- -------------------------------------------------------------------------------------------------
 
---- Starts a launch through nvim-dap, after building the module unless told not to.
----
---- `noDebug = true` is what makes this a *run* rather than a *debug*: the adapter still starts the
---- same JDWP-suspended JVM (see README "A breakpoint set before launching is honoured"), and nvim-dap
---- simply tells the server not to wait on the debug protocol handshake for output to start flowing.
----
---- Every step -- build command, launch resolution, debug server -- goes to one server: the one for
---- the class's project, not whichever started first.
---- @param main_class string fully qualified class name
---- @param uri string the class's source document, so the server can resolve without a round trip
---- @param no_debug boolean
---- @param opts { build: boolean|nil, client: vim.lsp.Client|nil }|nil `build = false` launches
----   whatever is already compiled; `client` is the server to launch on, by default the one whose
----   project contains `uri`
-local function launch(main_class, uri, no_debug, opts)
+--- The server that owns a launch for `uri`: `opts.client` when given, else the one whose project
+--- contains the file. Reports the problem and answers nil when there is none, or no nvim-dap.
+--- @param uri string
+--- @param opts { client: vim.lsp.Client|nil }|nil
+--- @return vim.lsp.Client|nil
+function M._launch_client(uri, opts)
   if not M.has_dap() then
     vim.notify('IntelliJ LSP: running requires nvim-dap (mfussenegger/nvim-dap).', vim.log.levels.ERROR)
-    return
+    return nil
   end
-
-  local client_module = require('intellij-lsp.client')
-  local c = opts and opts.client or client_module.find_ancestor_client(vim.uri_to_fname(uri))
+  local c = opts and opts.client
+    or require('intellij-lsp.client').find_ancestor_client(vim.uri_to_fname(uri))
   if not c then
     vim.notify('IntelliJ LSP: no server running for ' .. vim.uri_to_fname(uri) .. '.', vim.log.levels.ERROR)
-    return
+    return nil
   end
+  return c
+end
 
-  if building then
-    vim.notify('IntelliJ LSP: a build is already running; <C-c> in the output panel stops it.', vim.log.levels.WARN)
-    return
-  end
-
+--- Starts a DAP launch on `client` for a configuration with this module's fixed fields filled in.
+---
+--- `internalConsole` is load-bearing, not a preference: the server streams the program's output as
+--- DAP `output` events either way, but nvim-dap answers any other console with a terminal of its
+--- own and the panel would stay empty.
+---
+--- `noDebug = true` is what makes a launch a *run* rather than a *debug*: the server leaves out the
+--- JDWP agent, and nothing waits for a debugger to attach.
+--- @param client vim.lsp.Client
+--- @param config table the launch fields: `name`, `mainClass`, `file`, `noDebug`, ...
+function M._dap_run(client, config)
   ensure_dap_adapter()
+  require('dap').run(vim.tbl_extend('force', config, {
+    type = ADAPTER_ID,
+    request = 'launch',
+    console = 'internalConsole',
+    [CLIENT_FIELD] = client.id,
+  }))
+end
 
-  local function start()
-    resolve_launch(c, uri, function(err, paths)
-      vim.schedule(function()
-        if err then
-          vim.notify(
-            'IntelliJ LSP: could not resolve the launch: ' .. tostring(err.message or err),
-            vim.log.levels.ERROR
-          )
-          return
-        end
-        if not paths or not paths.javaExec then
-          vim.notify('IntelliJ LSP: the server returned no launch (no project JDK?).', vim.log.levels.ERROR)
-          return
-        end
-
-        require('dap').run({
-          type = ADAPTER_ID,
-          request = 'launch',
-          name = main_class,
-          mainClass = main_class,
-          classPaths = paths.classpath or {},
-          modulePaths = paths.modulePath or {},
-          moduleName = paths.moduleName,
-          moduleContentPaths = paths.moduleContentPaths or {},
-          javaExec = paths.javaExec,
-          vmArgs = paths.vmArgs or {},
-          cwd = paths.workingDirectory,
-          -- `internalConsole` is load-bearing, not a preference: only it makes the server spawn the
-          -- process itself and forward output as DAP `output` events. `integratedTerminal` issues a
-          -- `runInTerminal` request this client does not implement, and the panel would stay empty.
-          console = 'internalConsole',
-          noDebug = no_debug,
-          [CLIENT_FIELD] = c.id,
-        })
-      end)
-    end)
-  end
-
-  if build_before_run and not (opts and opts.build == false) then
-    M._build(c, uri, function(ok)
-      if ok then start() end
-    end)
-  else
-    start()
-  end
+--- Runs (or debugs) a main class through nvim-dap.
+---
+--- `tool` is the build tool the server named on the lens (`maven`, `gradle`, ...). Left nil, the
+--- server uses the tool of the module, which is the same answer; the lens passes it anyway, so a
+--- module whose tool changed since the lens was drawn fails with the server's own message.
+---
+--- A debug launch goes to the plain JVM (`tool = 'java'`) instead: the module's tool still builds
+--- first, then `java` runs the program under the debugger. On 271.2085.0 a Gradle debug launch
+--- through Gradle itself (its generated `ideRun` task) stops on breakpoints, but the server ends the
+--- session as soon as the debugger disconnects and the program's own output never arrives. The plain
+--- JVM is also how every launch ran up to bundle 263. The cost: a debug launch does not pick up JVM
+--- arguments the build script sets on its run task.
+--- @param main_class string fully qualified class name
+--- @param uri string the class's source document: the server runs the module that owns it
+--- @param no_debug boolean
+--- @param opts { client: vim.lsp.Client|nil, tool: string|nil }|nil `client` is the server to launch
+---   on, by default the one whose project contains `uri`
+local function launch(main_class, uri, no_debug, opts)
+  local c = M._launch_client(uri, opts)
+  if not c then return end
+  M._dap_run(c, {
+    name = main_class,
+    mainClass = main_class,
+    file = vim.uri_to_fname(uri),
+    tool = no_debug and opts and opts.tool or (not no_debug and 'java' or nil),
+    noDebug = no_debug,
+  })
 end
 
 M.launch = launch
@@ -377,9 +210,31 @@ M.launch = launch
 --- The program's output goes to the shared panel in `output.lua`, the same buffer the build tool's
 --- import log is written to. See that module for why they share one.
 
+--- Writes one DAP `output` event to the panel.
+---
+--- The build that precedes a launch streams through here too, so its lines get the highlight the
+--- import log gives them (`[ERROR]` red, `BUILD SUCCESS` green). The server's own `console` lines --
+--- `[Build]`, `[Run] app`, `Process finished with exit code 1` -- are dimmed: they frame the output
+--- rather than belong to it.
+--- @param body { category: string|nil, output: string }
+function M._append_output(body)
+  if body.category == 'console' then
+    local text = vim.trim(body.output)
+    if text ~= '' then output.append(text, 'Comment') end
+    return
+  end
+  local hl = require('intellij-lsp.progress')._import_hl
+  for _, line in ipairs(vim.split(body.output:gsub('\n$', ''), '\n', { plain = true })) do
+    output.append(line, hl(nil, line) or (body.category == 'stderr' and 'WarningMsg' or nil))
+  end
+end
+
 if M.has_dap() then
   require('dap').listeners.after.event_output['intellij-lsp.run'] = function(session, body)
-    if M.owns(session) and body and body.output then output.append(body.output) end
+    if not M.owns(session) or not body or not body.output then return end
+    -- A test run's stdout is the runner's service messages; `test.lua` renders those itself.
+    if require('intellij-lsp.test').owns(session) then return end
+    M._append_output(body)
   end
 
   -- Opens on the first output of a session rather than at launch: with none yet there is nothing to
@@ -405,8 +260,10 @@ local function register_lens_command()
     local args = (command.arguments or {})[1] or {}
     if not args.mainClass then return end
     local uri = args.uri or vim.uri_from_bufnr(ctx and ctx.bufnr or 0)
-    launch(args.mainClass, uri, args.noDebug ~= false,
-      { client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil })
+    launch(args.mainClass, uri, args.noDebug ~= false, {
+      client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil,
+      tool = args.tool,
+    })
   end
 end
 
@@ -474,8 +331,7 @@ end
 
 --- Runs (or debugs) the main class enclosing the cursor.
 --- @param no_debug boolean|nil defaults to true, i.e. run rather than debug
---- @param opts { build: boolean|nil }|nil see `launch`
-function M.run_at_cursor(no_debug, opts)
+function M.run_at_cursor(no_debug)
   local bufnr = vim.api.nvim_get_current_buf()
   local c = vim.lsp.get_clients({ bufnr = bufnr, name = require('intellij-lsp.client').NAME })[1]
   if not c then
@@ -499,43 +355,32 @@ function M.run_at_cursor(no_debug, opts)
         return
       end
 
-      launch(class, vim.uri_from_bufnr(bufnr), no_debug == nil or no_debug,
-        vim.tbl_extend('force', opts or {}, { client = c }))
+      launch(class, vim.uri_from_bufnr(bufnr), no_debug == nil or no_debug, { client = c })
     end
   )
 end
 
---- Stops the build in flight, or else the running launch.
----
---- A build and a program never overlap -- the launch starts only once the build has exited -- so
---- whichever exists is the one `<C-c>` means. The wrapper scripts (`mvnw`, `gradlew`) `exec` the JVM,
---- so the signal reaches the build tool itself and not a shell in front of it.
+--- Stops the running launch, its build included: the build runs inside the launch on the server,
+--- so terminating the session ends whichever of the two is running.
 ---
 --- nvim-dap has one active session at a time, so terminating it is unambiguous; a second `<leader>rr`
 --- while one is running starts a second session and nvim-dap itself asks which to terminate.
 function M.stop()
-  if building then
-    building.cancelled = true
-    building.proc:kill('sigterm')
-    return
-  end
+  -- A test run still waiting on the server has no session yet; test.lua drops it instead.
+  local test = package.loaded['intellij-lsp.test']
+  if test and test.stop() then return end
   if not M.has_dap() then return end
   require('dap').terminate()
 end
 
---- @param opts { build_before_run: boolean|nil }|nil
-function M.setup(opts)
-  if opts and opts.build_before_run ~= nil then build_before_run = opts.build_before_run end
+function M.setup()
   register_lens_command()
   ensure_dap_adapter()
   -- `q` closes the panel without stopping the program; this is the key that stops it.
   output.keymap('<C-c>', M.stop, 'IntelliJ: stop the build or the running program')
 
-  vim.api.nvim_create_user_command('IntellijLspRun', function(cmd)
-    M.run_at_cursor(true, { build = not cmd.bang })
-  end, {
-    bang = true,
-    desc = 'IntelliJ: run the main class at the cursor (! skips the build)',
+  vim.api.nvim_create_user_command('IntellijLspRun', function() M.run_at_cursor(true) end, {
+    desc = 'IntelliJ: run the main class at the cursor',
   })
   vim.api.nvim_create_user_command('IntellijLspRunStop', M.stop, {
     desc = 'IntelliJ: stop the build or the running program',

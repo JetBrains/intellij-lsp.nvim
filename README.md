@@ -155,7 +155,7 @@ require('intellij-lsp').setup({
   -- Git, run, debug ---------------------------------------------------------
   git = true,                     -- :IntellijGitStatus, :IntellijGitDiff, :IntellijGitLog, :IntellijGitBranches
   run = true,                     -- run the main class at the cursor (needs nvim-dap)
-  build_before_run = true,        -- compile with the build tool before each run or debug launch
+  test = true,                    -- run and debug tests: lenses, <leader>rt / <leader>dt, results (needs run)
   debug = true,                   -- breakpoints, stepping, debug panel (needs run and nvim-dap)
 })
 ```
@@ -177,6 +177,21 @@ keymaps = { prefix = '<localleader>' },  -- <localleader>rr, <localleader>ts, <l
 `keymaps = false` installs none of them; the `:IntellijLsp*` commands and the Run / Debug code
 lenses work either way.
 
+Every launch, test or not, is built first by the project's build tool. The server runs that
+build itself, as part of the launch, so its output appears in the panel before the program's.
+
+### Tests
+
+JUnit 4, JUnit 5 and TestNG tests, in Java and Kotlin, get a Run Test and a Debug Test lens on
+each test class and test method. `<leader>rt` (`:IntellijLspTest`) runs the test method the cursor
+is in, or the whole class when the cursor is elsewhere in it. `<leader>dt`
+(`:IntellijLspTestDebug`) does the same under the debugger, so breakpoints hit.
+
+The tests run on IntelliJ's own test runner, with results in the output panel: `✓` passed,
+`✗` failed with the expected and actual values and the stack trace, `○` skipped, then a summary
+line. Failed tests also go to the quickfix list (`:copen`), each on the line that asserted.
+`<leader>rT` (`:IntellijLspTestLast`) runs the last test run again.
+
 ### In a Java or Kotlin buffer
 
 | Key | Action |
@@ -189,8 +204,11 @@ lenses work either way.
 | `(` or `,` (insert mode) | opens the parameter popup for the call being typed |
 | `gra` | IntelliJ's intentions and quick fixes; variants and live templates are handled in place |
 | `<leader>rr` | run the main class at the cursor |
-| `<leader>rl` | run the code lens on the current line (the Run / Debug lenses above a `main`) |
+| `<leader>rl` | run the code lens on the current line (Run / Debug above a `main`, Run Test / Debug Test above a test) |
 | `<leader>rd` | debug the class at the cursor |
+| `<leader>rt` | run the test at the cursor: the test method around it, else its class |
+| `<leader>dt` | debug the test at the cursor |
+| `<leader>rT` | run the last test run again |
 | `<leader>b` | toggle a breakpoint on this line |
 | `<leader>B` | breakpoint with a condition |
 | `<leader>dc` | continue |

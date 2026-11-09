@@ -973,6 +973,9 @@ function M.set_keymaps(bufnr, prefix)
   map('b', M.toggle_breakpoint, 'IntelliJ: toggle a breakpoint')
   map('B', M.toggle_conditional_breakpoint, 'IntelliJ: breakpoint with a condition')
   map('rd', function() require('intellij-lsp.run').run_at_cursor(false) end, 'IntelliJ: debug the class at the cursor')
+  if require('intellij-lsp').config.test ~= false then
+    map('dt', function() require('intellij-lsp.test').run_at_cursor(false) end, 'IntelliJ: debug the test at the cursor')
+  end
   map('dc', M.continue, 'IntelliJ: continue')
   map('dn', M.step_over, 'IntelliJ: step over')
   map('di', M.step_into, 'IntelliJ: step into')

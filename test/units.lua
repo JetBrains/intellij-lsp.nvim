@@ -2307,87 +2307,284 @@ output._reset()
 
 
 -- ---------------------------------------------------------------------------
--- run.lua: the build that precedes a launch. Drives `_build` / `_run_build` directly with a fake
--- client and `sh`, so it needs neither a server nor nvim-dap (absent under `-u NONE` anyway).
+-- run.lua: a launch's output in the panel. The build runs inside the launch on the server (271), so
+-- its lines arrive as DAP `output` events and get the import log's colours here.
 -- ---------------------------------------------------------------------------
+do
 local run = require('intellij-lsp.run')
-
--- `_build_to_run` is the client-side half of the `resolveBuildCommand` contract: unsupported ->
--- nothing plus the reason, empty command -> nothing.
-local b, why = run._build_to_run({ supported = true, tool = 'maven', cwd = '/w', command = { 'mvn', 'compile' } })
-check('build: supported answer yields a build', b and b.command[1] == 'mvn' and b.cwd == '/w' and b.tool == 'maven')
-b, why = run._build_to_run({ supported = false, reason = 'no build tool owns this module' })
-check('build: unsupported yields nothing and the reason', b == nil and why == 'no build tool owns this module')
-b, why = run._build_to_run({ supported = true, command = {} })
-check('build: empty command yields nothing', b == nil and why == nil)
-check('build: nil answer yields nothing', run._build_to_run(nil) == nil)
 
 local function panel_text()
   return table.concat(vim.api.nvim_buf_get_lines(output.buf(), 0, -1, false), '\n')
 end
-local function wait_for(pred) return vim.wait(5000, pred, 20) end
-
--- A failing build stops the launch, its output (both streams) is in the panel, and the panel is open.
-output._reset()
-local result = nil
-run._run_build({ tool = 'maven', command = { 'sh', '-c', 'echo compiling; echo "[ERROR] /w/A.java:[3,5] boom" >&2; exit 3' } },
-  function(ok) result = ok end)
-check('build: failure -> not ok', wait_for(function() return result ~= nil end) and result == false, tostring(result))
-check('build: stdout reaches the panel', wait_for(function() return panel_text():find('compiling', 1, true) ~= nil end))
-check('build: stderr reaches the panel', panel_text():find('[ERROR] /w/A.java', 1, true) ~= nil, panel_text())
-check('build: failure separator names the exit code', panel_text():find('build failed, exit 3', 1, true) ~= nil, panel_text())
-check('build: failure opens the panel', output.is_open())
-
--- Exit 0 continues to the launch. The output has no trailing newline, so the last line arrives as a
--- partial chunk and is only written by the exit-time flush.
-output._reset()
-result = nil
-run._run_build({ tool = 'gradle', command = { 'sh', '-c', 'printf "one\\ntwo"' } }, function(ok) result = ok end)
-check('build: success -> ok', wait_for(function() return result ~= nil end) and result == true, tostring(result))
-check('build: partial last line is flushed', wait_for(function() return panel_text():find('\ntwo\n', 1, true) ~= nil end), panel_text())
-check('build: success separator', panel_text():find('gradle: build succeeded', 1, true) ~= nil, panel_text())
-
--- A command that cannot be spawned is a failed build, not a skipped one.
-output._reset()
-result = nil
-run._run_build({ command = { '/nonexistent/mvn', 'compile' } }, function(ok) result = ok end)
-check('build: unspawnable -> not ok', wait_for(function() return result ~= nil end) and result == false, tostring(result))
-check('build: unspawnable is reported', wait_for(function() return panel_text():find('build failed to start', 1, true) ~= nil end), panel_text())
-
--- `stop()` during a build kills it and the launch never happens.
-output._reset()
-result = nil
-run._run_build({ tool = 'maven', command = { 'sh', '-c', 'sleep 30' } }, function(ok) result = ok end)
-vim.wait(100)
-run.stop()
-check('build: stop reports it', wait_for(function() return panel_text():find('build stopped', 1, true) ~= nil end), panel_text())
-vim.wait(100)
-check('build: stop never continues to the launch', result == nil)
-
--- `_build` with a fake client: a lookup failure or an unsupported module launches anyway and says so.
-local function fake_client(err, resolved)
-  return { request = function(_, method, params, handler)
-    check('build: asks resolveBuildCommand', method == 'workspace/executeCommand'
-      and params.command == 'intellij.java.resolveBuildCommand' and params.arguments[1].uri == 'file:///w/A.java')
-    handler(err, resolved)
-  end }
+local function panel_hl_of(text)
+  output._flush()
+  local buf = output.buf()
+  local ns = vim.api.nvim_get_namespaces()
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    if line == text then
+      for _, id in pairs(ns) do
+        for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, id, { i - 1, 0 }, { i - 1, -1 }, { details = true })) do
+          if m[4].line_hl_group then return m[4].line_hl_group end
+        end
+      end
+      return nil
+    end
+  end
+  return 'missing'
 end
+
 output._reset()
-result = nil
-run._build(fake_client({ message = 'server busy' }, nil), 'file:///w/A.java', function(ok) result = ok end)
-check('build: lookup error -> launch anyway', wait_for(function() return result ~= nil end) and result == true)
-check('build: lookup error is noted', wait_for(function() return panel_text():find('build skipped: server busy', 1, true) ~= nil end), panel_text())
+run._append_output({ category = 'console', output = '[Run] app\n' })
+run._append_output({ category = 'stdout', output = '[ERROR] /w/A.java:[3,5] boom\n[INFO] BUILD SUCCESS\n' })
+run._append_output({ category = 'stdout', output = 'Hello, world!\n' })
+run._append_output({ category = 'console', output = '\nProcess finished with exit code 0\n' })
+output._flush()
+check('run output: lines reach the panel in order',
+  panel_text() == '[Run] app\n[ERROR] /w/A.java:[3,5] boom\n[INFO] BUILD SUCCESS\nHello, world!\nProcess finished with exit code 0',
+  panel_text())
+check('run output: a build error is red', panel_hl_of('[ERROR] /w/A.java:[3,5] boom') == 'DiagnosticError')
+check('run output: the server\'s console lines are dimmed', panel_hl_of('[Run] app') == 'Comment')
+check('run output: program output is plain', panel_hl_of('Hello, world!') == nil)
 output._reset()
-result = nil
-run._build(fake_client(nil, { supported = false, reason = 'JPS module' }), 'file:///w/A.java', function(ok) result = ok end)
-check('build: unsupported -> launch anyway', wait_for(function() return result ~= nil end) and result == true)
-check('build: unsupported reason is noted', wait_for(function() return panel_text():find('build skipped: JPS module', 1, true) ~= nil end), panel_text())
-output._reset()
-result = nil
-run._build(fake_client(nil, { supported = true, tool = 'maven', command = { 'sh', '-c', 'exit 0' } }), 'file:///w/A.java',
-  function(ok) result = ok end)
-check('build: resolved command runs and continues', wait_for(function() return result ~= nil end) and result == true)
-output._reset()
+
+-- ---------------------------------------------------------------------------
+-- test.lua: service messages, the report, failure locations, and the lens at the cursor. All
+-- pure; captured from server 271.2085.0 with JUnit 5.11.4 where the shape matters.
+-- ---------------------------------------------------------------------------
+local test_mod = require('intellij-lsp.test')
+
+local m = test_mod._parse_message("##teamcity[testStarted name='greetsByName()' locationHint='java:test://com.example.GreeterTest/greetsByName']")
+check('tc: name and attributes', m and m.name == 'testStarted' and m.attributes.name == 'greetsByName()'
+  and m.attributes.locationHint == 'java:test://com.example.GreeterTest/greetsByName', vim.inspect(m))
+m = test_mod._parse_message("##teamcity[testFailed id='|[engine:junit-jupiter|]' message='it|'s |\"x|\" a||b|nnext' x='|0x00e9']")
+check('tc: escapes', m and m.attributes.id == '[engine:junit-jupiter]' and m.attributes.message == "it's |\"x|\" a|b\nnext",
+  vim.inspect(m and m.attributes))
+check('tc: |0xNNNN', m and m.attributes.x == 'é', vim.inspect(m and m.attributes.x))
+m = test_mod._parse_message("##teamcity[enteredTheMatrix]")
+check('tc: no attributes', m and m.name == 'enteredTheMatrix' and next(m.attributes) == nil)
+m = test_mod._parse_message("##teamcity[buildStatus 'SUCCESS']")
+check('tc: argument form', m and m.argument == 'SUCCESS')
+m = test_mod._parse_message("##teamcity[testStarted name='a' broken locationHint='x']")
+check('tc: malformed pair keeps what parsed before it', m and m.attributes.name == 'a' and m.attributes.locationHint == nil)
+check('tc: not a message', test_mod._parse_message('[INFO] BUILD SUCCESS') == nil)
+
+local parts = test_mod._split_line("partial##teamcity[testFinished name='a()']")
+check('tc: text before a marker is its own part', #parts == 2 and parts[1] == 'partial' and parts[2].name == 'testFinished',
+  vim.inspect(parts))
+parts = test_mod._split_line("##teamcity[testStdOut name='a' out='|]']##teamcity[testFinished name='a']")
+check('tc: two messages on a line, an escaped ] inside', #parts == 2 and parts[1].attributes.out == ']'
+  and parts[2].name == 'testFinished', vim.inspect(parts))
+parts = test_mod._split_line('')
+check('tc: a blank line stays a blank line', #parts == 1 and parts[1] == '')
+
+local stream = test_mod._stream()
+parts = stream.feed("##teamcity[testStarted na")
+check('tc stream: a split message waits for its line', #parts == 0)
+parts = stream.feed("me='a()']\r\nhello\nwor")
+check('tc stream: completes across chunks, CRLF too', #parts == 2 and parts[1].name == 'testStarted' and parts[2] == 'hello',
+  vim.inspect(parts))
+parts = stream.flush()
+check('tc stream: flush gives the last partial line', #parts == 1 and parts[1] == 'wor', vim.inspect(parts))
+
+-- The report, fed the run captured from 271.2085.0 (shortened ids and trace).
+local lines = {}
+local report = test_mod._report(function(text, hl) lines[#lines + 1] = { text, hl } end)
+local ID = '|[engine:junit-jupiter|]/|[class:com.example.GreeterTest|]/|[method:%s()|]'
+local function tc(name, attrs)
+  local out = {}
+  for k, v in pairs(attrs) do out[#out + 1] = ("%s='%s'"):format(k, v) end
+  table.sort(out)
+  return ('##teamcity[%s %s]\n'):format(name, table.concat(out, ' '))
+end
+local function node(method, extra)
+  return vim.tbl_extend('force', { id = ID:format(method), nodeId = ID:format(method), name = method .. '()',
+    parentNodeId = '0' }, extra or {})
+end
+report:feed('console', '[Build] \n')
+report:feed('stdout', '[INFO] BUILD SUCCESS\n')
+report:feed('console', '[Run] ijtests\n')
+report:feed('stdout', '##teamcity[enteredTheMatrix]\n' .. tc('suiteTreeNode', node('greetsByName')) .. '##teamcity[treeEnded]\n')
+report:feed('stdout', tc('testStarted', node('greetsByName', { locationHint = 'java:test://com.example.GreeterTest/greetsByName' })))
+report:feed('stdout', 'stdout from greetsByName\n')
+report:feed('stdout', tc('testFinished', node('greetsByName', { duration = '9' })))
+report:feed('stdout', tc('testStarted', node('failsOnPurpose', { locationHint = 'java:test://com.example.GreeterTest/failsOnPurpose' })))
+report:feed('stdout', tc('testFailed', node('failsOnPurpose', {
+  message = 'org.opentest4j.AssertionFailedError: ', expected = 'Goodbye, world!', actual = 'Hello, world!',
+  details = '|n\tat org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:182)|n\tat com.example.GreeterTest.failsOnPurpose(GreeterTest.java:17)|n\tat java.base/java.lang.reflect.Method.invoke(Method.java:565)|n',
+})))
+report:feed('stdout', tc('testFinished', node('failsOnPurpose', { duration = '3' })))
+report:feed('stdout', tc('testStarted', node('skipped', { locationHint = 'java:test://com.example.GreeterTest/skipped' })))
+report:feed('stdout', tc('testIgnored', node('skipped', { message = 'not yet' })))
+report:feed('stdout', tc('testFinished', node('skipped')))
+report:feed('console', '\nProcess finished with exit code 255\n')
+local result = report:finish(255)
+local texts = vim.tbl_map(function(l) return l[1] end, lines)
+local joined = table.concat(texts, '\n')
+check('report: counts', result.passed == 1 and result.failed == 1 and result.skipped == 1 and not result.ok, vim.inspect(result))
+check('report: no raw service message reaches the panel', not joined:find('##teamcity', 1, true), joined)
+check('report: build output and the test\'s own stdout pass through',
+  joined:find('[INFO] BUILD SUCCESS', 1, true) and joined:find('stdout from greetsByName', 1, true), joined)
+check('report: pass line', vim.tbl_contains(texts, '✓ greetsByName() (9 ms)'), joined)
+check('report: fail line and why', vim.tbl_contains(texts, '✗ failsOnPurpose()')
+  and vim.tbl_contains(texts, '    expected: <Goodbye, world!> but was: <Hello, world!>'), joined)
+check('report: the stack trace stays jumpable',
+  require('intellij-lsp.output')._jump_target('    \tat com.example.GreeterTest.failsOnPurpose(GreeterTest.java:17)') ~= nil
+  and joined:find('    \tat com.example.GreeterTest.failsOnPurpose(GreeterTest.java:17)', 1, true), joined)
+check('report: skip line with its reason', vim.tbl_contains(texts, '○ skipped() (not yet)'), joined)
+check('report: summary', texts[#texts]:match('^%-%-%- Tests: 1 failed, 1 passed, 1 skipped %(') ~= nil
+  and lines[#lines][2] == 'DiagnosticError', texts[#texts])
+local failures = report:failures()
+check('report: the failure carries its location', #failures == 1
+  and failures[1].location == 'java:test://com.example.GreeterTest/failsOnPurpose', vim.inspect(failures))
+
+report = test_mod._report(function() end)
+result = report:finish(1)
+check('report: nothing ran (a failed build) is not a pass', not result.ok
+  and result.text:find('exited with code 1', 1, true), vim.inspect(result))
+lines = {}
+report = test_mod._report(function(text, hl) lines[#lines + 1] = { text, hl } end)
+report:feed('stdout', tc('testStarted', node('a')) .. tc('testFinished', node('a')))
+result = report:finish(0)
+check('report: all passed is ok and green', result.ok and lines[#lines][2] == 'DiagnosticOk'
+  and lines[#lines][1]:find('Tests: 1 passed', 1, true), vim.inspect(lines))
+-- A second failure for one test (assertion, then a failing @AfterEach) counts once.
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testStarted', node('a')) .. tc('testFailed', node('a', { message = 'one' }))
+  .. tc('testFailed', node('a', { message = 'two' })) .. tc('testFinished', node('a')))
+result = report:finish(255)
+check('report: two failures of one test count once', result.failed == 1 and result.passed == 0, vim.inspect(result))
+-- Parametrized invocations share a name; the nodeId keeps them apart.
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testStarted', { nodeId = '1', name = '|[1|] x' }) .. tc('testFinished', { nodeId = '1', name = '|[1|] x' })
+  .. tc('testStarted', { nodeId = '2', name = '|[1|] x' }) .. tc('testFinished', { nodeId = '2', name = '|[1|] x' }))
+check('report: invocations with one name count apart', report:finish(0).passed == 2)
+
+check('failure text: message without values', test_mod._failure_text({ message = 'boom' }) == 'boom')
+check('failure text: message and values', test_mod._failure_text({ message = 'sum ==> ', expected = '2', actual = '1' })
+  == 'sum ==>: expected: <2> but was: <1>', test_mod._failure_text({ message = 'sum ==> ', expected = '2', actual = '1' }))
+check('failure text: a bare exception class gives way to the values',
+  test_mod._failure_text({ message = 'org.opentest4j.AssertionFailedError: ', expected = 'a', actual = 'b' })
+  == 'expected: <a> but was: <b>')
+
+local cls, meth = test_mod._location_parts('java:test://com.example.GreeterTest/failsOnPurpose')
+check('location: test', cls == 'com.example.GreeterTest' and meth == 'failsOnPurpose')
+cls, meth = test_mod._location_parts('java:suite://com.example.GreeterTest$Inner')
+check('location: suite', cls == 'com.example.GreeterTest$Inner' and meth == nil)
+local trace = '\tat org.junit.Assert.fail(Assert.java:89)\n\tat com.example.FooTest$Inner.check(FooTest.java:42)\n\tat com.example.FooTest.x(FooTest.java:7)'
+check('failure line: deepest frame of the test class, nested counts', test_mod._failure_line(trace, 'com.example.FooTest') == 42)
+check('failure line: none for another class', test_mod._failure_line(trace, 'com.example.Other') == nil)
+check('label: method', test_mod._label('com.example.GreeterTest#greetsByName') == 'GreeterTest#greetsByName')
+check('label: class', test_mod._label('com.example.GreeterTest') == 'GreeterTest')
+
+-- The lens at the cursor. Ranges as 271 sends them: each lens covers the declaration's name only.
+local function r(l1, c1, l2, c2) return { start = { line = l1, character = c1 }, ['end'] = { line = l2, character = c2 } } end
+local function lens(line, test_id, no_debug)
+  return { range = r(line, 9, line, 20), command = { command = 'intellij.jvm.runTest', title = 'Run Test',
+    arguments = { { testId = test_id, uri = 'file:///w/T.java', noDebug = no_debug } } } }
+end
+local lenses = {
+  lens(7, 'p.T', true), lens(7, 'p.T', false),
+  lens(9, 'p.T#a', true), lens(9, 'p.T#a', false),
+  lens(15, 'p.T#b', true), lens(15, 'p.T#b', false),
+  { range = r(3, 0, 3, 4), command = { command = 'intellij.jvm.runMain', arguments = { { mainClass = 'p.Main' } } } },
+}
+local symbols = { { name = 'T', kind = 5, range = r(7, 0, 25, 1), selectionRange = r(7, 6, 7, 7), children = {
+  { name = 'a()', kind = 6, range = r(8, 4, 12, 5), selectionRange = r(9, 9, 9, 10) },
+  { name = 'b()', kind = 6, range = r(14, 4, 17, 5), selectionRange = r(15, 9, 15, 10) },
+  { name = 'helper()', kind = 6, range = r(19, 4, 22, 5), selectionRange = r(19, 9, 19, 15) },
+  { name = 'field', kind = 8, range = r(24, 4, 24, 20), selectionRange = r(24, 8, 24, 13) },
+} } }
+local function picked(row, no_debug)
+  local l = test_mod._pick_lens(lenses, symbols, row, no_debug)
+  return l and l.command.arguments[1].testId .. (l.command.arguments[1].noDebug and ':run' or ':debug')
+end
+check('pick: inside a test method body', picked(11, true) == 'p.T#a:run', picked(11, true))
+check('pick: on the annotation line above the name', picked(8, true) == 'p.T#a:run', picked(8, true))
+check('pick: debug picks the Debug lens', picked(16, false) == 'p.T#b:debug', picked(16, false))
+check('pick: a helper method runs the class', picked(20, true) == 'p.T:run', picked(20, true))
+check('pick: between methods runs the class', picked(13, true) == 'p.T:run', picked(13, true))
+check('pick: above the class (imports) runs the file\'s class', picked(2, true) == 'p.T:run', picked(2, true))
+check('pick: a file without tests has no lens', test_mod._pick_lens({ lenses[7] }, symbols, 11, true) == nil)
+check('pick: the indentation in front of a method is the method', (function()
+  local l = test_mod._pick_lens(lenses, symbols, 11, true, 0)
+  return l and l.command.arguments[1].testId == 'p.T#a'
+end)())
+
+-- A one-line class: `class T { @Test void a() {} @Test void b() {} }`, every name on line 0.
+local one_line_lenses = {
+  { range = r(0, 6, 0, 7), command = { command = 'intellij.jvm.runTest', arguments = { { testId = 'p.T', noDebug = true } } } },
+  { range = r(0, 21, 0, 22), command = { command = 'intellij.jvm.runTest', arguments = { { testId = 'p.T#a', noDebug = true } } } },
+  { range = r(0, 39, 0, 40), command = { command = 'intellij.jvm.runTest', arguments = { { testId = 'p.T#b', noDebug = true } } } },
+}
+local one_line_symbols = { { name = 'T', kind = 5, range = r(0, 0, 0, 47), selectionRange = r(0, 6, 0, 7), children = {
+  { name = 'a()', kind = 6, range = r(0, 10, 0, 27), selectionRange = r(0, 21, 0, 22) },
+  { name = 'b()', kind = 6, range = r(0, 28, 0, 45), selectionRange = r(0, 39, 0, 40) },
+} } }
+local function picked_one_line(col)
+  local l = test_mod._pick_lens(one_line_lenses, one_line_symbols, 0, true, col)
+  return l and l.command.arguments[1].testId
+end
+check('pick: one-line class, cursor in the second method', picked_one_line(42) == 'p.T#b', picked_one_line(42))
+check('pick: one-line class, cursor in the first method', picked_one_line(24) == 'p.T#a', picked_one_line(24))
+check('pick: one-line class, cursor on the class name', picked_one_line(6) == 'p.T', picked_one_line(6))
+
+-- Kotlin: a backticked name keeps its spaces in the frame; a JDK frame carries its module.
+check('failure line: Kotlin backtick name', test_mod._failure_line(
+  '\tat org.junit.Assert.fail(Assert.java:89)\n\tat p.FooTest.adds two numbers(FooTest.kt:23)\n', 'p.FooTest') == 23)
+check('failure line: a module prefix is not the class', test_mod._failure_line(
+  '\tat java.base/p.FooTest.x(FooTest.java:5)', 'p.FooTest') == 5)
+
+-- TestNG configuration methods are not tests; a failing one is a failure.
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testStarted', { nodeId = 'c1', name = 'setUp', config = 'true' }) .. tc('testFinished', { nodeId = 'c1', name = 'setUp' })
+  .. tc('testStarted', { nodeId = 't1', name = 'theTest' }) .. tc('testFinished', { nodeId = 't1', name = 'theTest' }))
+result = report:finish(0)
+check('report: a TestNG configuration method is not counted', result.passed == 1 and result.ok, vim.inspect(result))
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testStarted', { nodeId = 'c1', name = 'setUp', config = 'true' })
+  .. tc('testFailed', { nodeId = 'c1', name = 'setUp', message = 'db down' }) .. tc('testFinished', { nodeId = 'c1', name = 'setUp' })
+  .. tc('testStarted', { nodeId = 't1', name = 'theTest' }) .. tc('testIgnored', { nodeId = 't1', name = 'theTest' })
+  .. tc('testFinished', { nodeId = 't1', name = 'theTest' }))
+result = report:finish(255)
+check('report: a failing configuration method fails the run', result.failed == 1 and result.skipped == 1 and not result.ok,
+  vim.inspect(result))
+
+-- JUnit 4 sends names only: `works()` in two classes of one suite are two tests.
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testSuiteStarted', { name = 'a.FooTest' }) .. tc('testStarted', { name = 'works', locationHint = 'java:test://a.FooTest/works' })
+  .. tc('testFinished', { name = 'works' }) .. tc('testSuiteStarted', { name = 'b.FooTest' })
+  .. tc('testStarted', { name = 'works', locationHint = 'java:test://b.FooTest/works' })
+  .. tc('testFailed', { name = 'works', message = 'boom' }) .. tc('testFinished', { name = 'works' }))
+result = report:finish(255)
+local j4 = report:failures()
+check('report: name-only tests with one name count apart', result.passed == 1 and result.failed == 1, vim.inspect(result))
+check('report: the failure keeps its own class', #j4 == 1 and j4[1].location == 'java:test://b.FooTest/works', vim.inspect(j4))
+
+-- A run cut short is not a pass: a test that never finished, a nonzero exit, a stop.
+lines = {}
+report = test_mod._report(function(text, hl) lines[#lines + 1] = { text, hl } end)
+report:feed('stdout', tc('testStarted', node('a')) .. tc('testFinished', node('a')) .. tc('testStarted', node('b')))
+report:feed('console', '\nProcess finished with exit code 1\n')
+result = report:finish(nil)
+check('report: a test that never finished fails the run', not result.ok and result.interrupted == 1 and result.passed == 1,
+  vim.inspect(result))
+check('report: the exit code comes from the console line', result.exit_code == 1, vim.inspect(result))
+check('report: the unfinished test is named', vim.tbl_contains(vim.tbl_map(function(l) return l[1] end, lines), '! b() (did not finish)'))
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testStarted', node('a')) .. tc('testFinished', node('a')))
+report:feed('console', '\nProcess finished with exit code 1\n')
+result = report:finish(nil)
+check('report: all passed but exit 1 is not ok', not result.ok and result.text:find('exited with code 1', 1, true), vim.inspect(result))
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testStarted', node('a')) .. tc('testFinished', node('a')))
+report.stopped = true
+result = report:finish(nil)
+check('report: a stopped run is not ok', not result.ok and result.text:find('stopped', 1, true), vim.inspect(result))
+report = test_mod._report(function() end)
+report:feed('stdout', tc('testStarted', node('a')) .. tc('testFinished', node('a')))
+report:feed('console', '\nProcess finished with exit code 0\n')
+check('report: a clean exit 0 still passes', report:finish(nil).ok)
+end
 
 
 -- ---------------------------------------------------------------------------------------------
@@ -4738,6 +4935,7 @@ end)()
   for _, phase in ipairs({ 'before', 'after' }) do
     listeners[phase] = setmetatable({}, { __index = function(t, k) t[k] = {}; return t[k] end })
   end
+  listeners.on_session = {}
   local runs = {}
   local fake_dap = { listeners = listeners, adapters = {}, run = function(config) runs[#runs + 1] = config end,
     session = function() return nil end }
@@ -4766,10 +4964,13 @@ end)()
             result = { capabilities = { documentSymbolProvider = true, executeCommandProvider = { commands = {} } } }
           elseif method == 'textDocument/documentSymbol' then
             result = { { name = 'Main', kind = 5, range = rng(1, 0, 1), selectionRange = rng(1, 6, 10) } }
-          elseif params and params.command == 'intellij.java.resolveLaunch' then
-            result = { javaExec = '/jdk-' .. name .. '/bin/java', classpath = { root .. '/target/classes' }, workingDirectory = root }
           elseif params and params.command == 'start_debug_server' then
             result = 5005
+          elseif params and params.command == 'intellij.jvm.resolveTestLaunch' then
+            result = { { mainClass = 'com.intellij.rt.junit.JUnitStarter', args = { '-junit5', 'p.T,a' },
+              runtimeClasspath = { '/ij/junit-rt.jar' }, runtimeModulePath = { '/m2/launcher.jar' } } }
+          elseif params and params.command == 'intellij.java.resolveClassDocument' then
+            result = { uri = vim.uri_from_fname(root .. '/T.java') }
           end
           vim.schedule(function() callback(nil, result) end)
           return true, 1
@@ -4800,14 +5001,27 @@ end)()
 
   vim.api.nvim_set_current_buf(buf_b)
   vim.api.nvim_win_set_cursor(0, { 2, 0 })
-  run_mod.run_at_cursor(true, { build = false })
+  run_mod.run_at_cursor(true)
   vim.wait(2000, function() return #runs == 1 end, 20)
   local config = runs[1]
-  check('two projects: B resolves the launch for its own class', config and config.javaExec == '/jdk-b/bin/java',
-    vim.inspect(seen))
-  local resolved_on = vim.tbl_filter(function(s) return s.command == 'intellij.java.resolveLaunch' end, seen)
-  check('two projects: A is never asked', #resolved_on == 1 and resolved_on[1].root == root_b, vim.inspect(resolved_on))
+  -- `Main`, not `p.Main`: under `-u NONE` the buffer has no `java` filetype, so no package is read.
+  check('two projects: the launch names B\'s class and file', config and config.mainClass == 'Main'
+    and vim.endswith(config.file or '', '-b/Main.java') and config.intellijClientId == id_b, vim.inspect(config))
+  check('two projects: a launch is one DAP request, nothing resolved first',
+    #vim.tbl_filter(function(s) return s.method == 'workspace/executeCommand' end, seen) == 0, vim.inspect(seen))
+  check('two projects: the launch is a plain run through the internal console', config and config.noDebug == true
+    and config.console == 'internalConsole' and config.type == 'intellij_jvm' and config.request == 'launch', vim.inspect(config))
 
+  local after_restart
+  seen = {}
+  fake_dap.adapters.intellij_jvm(function(a) after_restart = a end,
+    vim.tbl_extend('force', config or {}, { intellijClientId = 99999, file = root_b .. '/Main.java' }))
+  vim.wait(2000, function() return after_restart ~= nil end, 20)
+  local started_on = vim.tbl_filter(function(s) return s.command == 'start_debug_server' end, seen)
+  check('run_last after a restart: the server of the launch\'s file takes over', after_restart ~= nil
+    and #started_on == 1 and started_on[1].root == root_b, vim.inspect(seen))
+
+  seen = {}
   local adapter
   fake_dap.adapters.intellij_jvm(function(a) adapter = a end, config or {})
   vim.wait(2000, function() return adapter ~= nil end, 20)
@@ -4820,9 +5034,141 @@ end)()
 
   -- The lens command: the client it came from, not the first one.
   seen, runs = {}, {}
-  vim.lsp.commands['intellij.jvm.runMain']({ arguments = { { mainClass = 'p.Main' } } }, { client_id = id_b, bufnr = buf_b })
+  vim.lsp.commands['intellij.jvm.runMain']({ arguments = { { mainClass = 'p.Main', tool = 'maven', noDebug = false,
+    uri = vim.uri_from_fname(root_b .. '/Main.java') } } }, { client_id = id_b, bufnr = buf_b })
   vim.wait(2000, function() return #runs == 1 end, 20)
-  check('two projects: a lens launches on its own server', runs[1] and runs[1].javaExec == '/jdk-b/bin/java', vim.inspect(seen))
+  check('two projects: a lens launches on its own server', runs[1] and runs[1].intellijClientId == id_b, vim.inspect(runs))
+  check('two projects: a debug lens runs on the plain JVM', runs[1] and runs[1].tool == 'java'
+    and runs[1].noDebug == false, vim.inspect(runs))
+  runs = {}
+  vim.lsp.commands['intellij.jvm.runMain']({ arguments = { { mainClass = 'p.Main', tool = 'maven', noDebug = true,
+    uri = vim.uri_from_fname(root_b .. '/Main.java') } } }, { client_id = id_b, bufnr = buf_b })
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  check('two projects: a run lens passes its tool through', runs[1] and runs[1].tool == 'maven'
+    and runs[1].noDebug == true, vim.inspect(runs))
+
+  -- A test lens: resolved on its own server, launched on the plain JVM with the runner's jars added.
+  local test_mod = require('intellij-lsp.test')
+  test_mod._reset()
+  test_mod.setup()
+  seen, runs = {}, {}
+  local test_uri = vim.uri_from_fname(root_b .. '/T.java')
+  vim.lsp.commands['intellij.jvm.runTest']({ arguments = { { testId = 'p.T#a', uri = test_uri, moduleName = 'b',
+    noDebug = true } } }, { client_id = id_b, bufnr = buf_b })
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  local tconf = runs[1]
+  local asked = vim.tbl_filter(function(s) return s.command == 'intellij.jvm.resolveTestLaunch' end, seen)
+  check('test lens: resolved on its own server', #asked == 1 and asked[1].root == root_b, vim.inspect(seen))
+  check('test lens: the runner on the plain JVM, its jars added to the module\'s', tconf
+    and tconf.mainClass == 'com.intellij.rt.junit.JUnitStarter' and tconf.tool == 'java'
+    and vim.deep_equal(tconf.args, { '-junit5', 'p.T,a' })
+    and vim.deep_equal(tconf.additionalClassPaths, { '/ij/junit-rt.jar' })
+    and vim.deep_equal(tconf.additionalModulePaths, { '/m2/launcher.jar' })
+    and vim.endswith(tconf.file or '', '-b/T.java') and tconf.classPaths == nil and tconf.noDebug == true
+    and tconf.intellijClientId == id_b, vim.inspect(tconf))
+
+  -- Its session: service messages are rendered, not dumped; the end fills the quickfix list.
+  local test_session = { id = 93, config = { type = 'intellij_jvm', name = tconf and tconf.name,
+    intellijTestRun = tconf and tconf.intellijTestRun } }
+  check('test lens: the launch carries its run token', tconf and type(tconf.intellijTestRun) == 'number', vim.inspect(tconf))
+  -- An older launch of the same test, same name, other token: not this run.
+  local stale = { id = 94, config = { type = 'intellij_jvm', name = tconf and tconf.name, intellijTestRun = -1 } }
+  check('test session: a same-named session of another launch is not the run', not test_mod.owns(stale))
+  local tc_out = require('intellij-lsp.output')
+  tc_out._reset()
+  local finished
+  test_mod.on_finished.units = function(res) finished = res end
+  for _, phase in ipairs({ 'before', 'after' }) do
+    for _, fn in pairs(listeners[phase].event_output) do
+      fn(test_session, { category = 'stdout', output = "##teamcity[testStarted nodeId='1' name='a()' locationHint='java:test://p.T/a']\n" })
+      fn(test_session, { category = 'stdout', output = "##teamcity[testFailed nodeId='1' name='a()' message='boom' details='|n\tat p.T.a(T.java:3)|n']\n" })
+    end
+  end
+  for _, fn in pairs(listeners.after.event_exited) do fn(test_session, { exitCode = 255 }) end
+  for _, fn in pairs(listeners.after.event_terminated) do fn(test_session, {}) end
+  vim.wait(2000, function() return finished ~= nil end, 20)
+  tc_out._flush()
+  local tc_panel = table.concat(vim.api.nvim_buf_get_lines(tc_out.buf(), 0, -1, false), '\n')
+  check('test session: no raw service message in the panel', not tc_panel:find('##teamcity', 1, true), tc_panel)
+  check('test session: the failure is reported once', select(2, tc_panel:gsub('✗ a%(%)', '')) == 1, tc_panel)
+  local qf = vim.fn.getqflist({ title = 1, items = 1 })
+  local qf_nr = vim.fn.getqflist({ nr = '$' }).nr
+  check('test session: failures land in the quickfix list on the asserting line', finished and finished.failed == 1
+    and qf.title == 'IntelliJ: test failures' and #qf.items == 1 and qf.items[1].lnum == 3
+    and vim.endswith(vim.api.nvim_buf_get_name(qf.items[1].bufnr), '-b/T.java') and qf.items[1].text == 'a(): boom',
+    vim.inspect(qf))
+  check('test session: the run is over, the next may start', not test_mod.owns(test_session))
+
+  -- A fake session for a launch: binds through `on_session`, ends through the listeners.
+  local next_id = 100
+  local function play(conf, chunks, exit)
+    next_id = next_id + 1
+    local sess = { id = next_id, config = { type = 'intellij_jvm', name = conf.name, intellijTestRun = conf.intellijTestRun } }
+    for _, fn in pairs(listeners.on_session) do fn(nil, sess) end
+    for _, chunk in ipairs(chunks) do
+      for _, fn in pairs(listeners.after.event_output) do fn(sess, { category = 'stdout', output = chunk }) end
+    end
+    if exit then for _, fn in pairs(listeners.after.event_exited) do fn(sess, { exitCode = exit }) end end
+    for _, fn in pairs(listeners.after.event_terminated) do fn(sess, {}) end
+    return sess
+  end
+
+  -- Fixed and rerun: the old failure leaves the list.
+  finished, runs = nil, {}
+  test_mod.rerun()
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  play(runs[1], { "##teamcity[testStarted nodeId='1' name='a()']\n##teamcity[testFinished nodeId='1' name='a()']\n" }, 0)
+  vim.wait(2000, function() return finished ~= nil end, 20)
+  check('rerun: passes', finished and finished.ok, vim.inspect(finished))
+  local after = vim.fn.getqflist({ title = 1, items = 1 })
+  check('rerun: a pass empties our quickfix list', after.title == 'IntelliJ: test failures' and #after.items == 0, vim.inspect(after))
+  check('rerun: and replaces it rather than stacking a new one', vim.fn.getqflist({ nr = '$' }).nr == qf_nr, vim.fn.getqflist({ nr = '$' }).nr)
+  -- Someone else's list stays when a run passes.
+  vim.fn.setqflist({}, ' ', { title = 'grep results', items = { { filename = '/x', lnum = 1, text = 'x' } } })
+  finished, runs = nil, {}
+  test_mod.rerun()
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  play(runs[1], { "##teamcity[testStarted nodeId='1' name='a()']\n##teamcity[testFinished nodeId='1' name='a()']\n" }, 0)
+  vim.wait(2000, function() return finished ~= nil end, 20)
+  check('rerun: a pass leaves another quickfix list alone', vim.fn.getqflist({ title = 1 }).title == 'grep results')
+
+  -- Two presses before the server answers: one run.
+  local notes = {}
+  local saved_notify = vim.notify
+  vim.notify = function(msg) notes[#notes + 1] = msg end
+  finished, runs = nil, {}
+  test_mod.rerun()
+  test_mod.rerun()
+  vim.wait(2000, function() return #runs >= 1 end, 20)
+  vim.wait(200)
+  check('busy: a second run before the first was resolved is refused', #runs == 1
+    and vim.iter(notes):any(function(n) return n:find('already in progress', 1, true) ~= nil end), vim.inspect(notes))
+  play(runs[1], { "##teamcity[testStarted nodeId='1' name='a()']\n##teamcity[testFinished nodeId='1' name='a()']\n" }, 0)
+  vim.wait(2000, function() return finished ~= nil end, 20)
+
+  -- The adapter cannot start the launch: the run is freed at once, not after a deadline.
+  finished, runs, notes = nil, {}, {}
+  test_mod.rerun()
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  require('intellij-lsp.test')._launch_failed(runs[1], 'no server running for it')
+  runs = {}
+  test_mod.rerun()
+  vim.wait(2000, function() return #runs == 1 end, 20)
+  check('adapter failure: the next run may start right away', #runs == 1, vim.inspect(notes))
+  -- Stopped while the server is resolving: dropped, and no launch follows.
+  require('intellij-lsp.run').stop()
+  runs = {}
+  test_mod.rerun()
+  check('stop while resolving: the run is gone', require('intellij-lsp.test').stop() == true)
+  vim.wait(300)
+  check('stop while resolving: no launch follows', #runs == 0, vim.inspect(runs))
+  vim.notify = saved_notify
+  test_mod._reset()
+
+  test_mod.on_finished.units = nil
+  vim.fn.setqflist({}, 'r')
+  tc_out.close()
+  tc_out._reset()
 
   -- Another adapter's session: no IntelliJ panel, no stack requests, no output in the panel.
   local requests = {}

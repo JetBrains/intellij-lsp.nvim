@@ -519,6 +519,11 @@ run
     Run the main class at the cursor with <leader>rr. Needs nvim-dap.
     Default: true.
 
+test
+    Run and debug JVM tests: the Run Test / Debug Test code lenses,
+    <leader>rt and <leader>dt for the test at the cursor, <leader>rT to
+    run the last one again. Needs `run` and nvim-dap. Default: true.
+
 debug
     Breakpoints, stepping, and a stack-and-variables panel. Needs `run`
     and nvim-dap. Default: true.
@@ -575,6 +580,10 @@ debug
 :IntellijGitBranches             List branches and switch between them.
 :IntellijLspRun                  Run the main class at the cursor.
 :IntellijLspRunStop              Stop the running program.
+:IntellijLspTest                 Run the test at the cursor: the method
+                                around it, else its class.
+:IntellijLspTestDebug            Debug the test at the cursor.
+:IntellijLspTestLast             Run the last test run again.
 :IntellijLspDebug                Debug the main class at the cursor.
 :IntellijLspDebugStop            End the debug session.
 :IntellijLspBreakpointToggle      Set a breakpoint on this line.
@@ -632,6 +641,9 @@ https://github.com/mfussenegger/nvim-dap.
 
     <leader>rr    run the main class at the cursor
     <leader>rl    run the code lens on the current line
+    <leader>rt    run the test at the cursor (the method, else its class)
+    <leader>dt    debug the test at the cursor
+    <leader>rT    run the last test run again
     <leader>b     toggle a breakpoint on this line
     <leader>B     breakpoint with a condition
     <leader>dc    continue
@@ -642,6 +654,14 @@ https://github.com/mfussenegger/nvim-dap.
 
 These follow `keymaps` like the navigation maps: another prefix moves them,
 false removes them and leaves the Run / Debug code lenses.
+
+The server builds before every launch, with the project's build tool, and
+streams that build into the panel ahead of the program's output.
+
+Tests (JUnit 4/5, TestNG; Java and Kotlin) run on IntelliJ's own runner.
+The panel shows each test as passed, failed (with expected/actual and the
+stack trace) or skipped, then a summary; failed tests also fill the
+quickfix list, each on the line that asserted.
 
 Program output and the build tool's import output (Maven's or Gradle's
 console) share one bottom panel. `build_output` in setup() decides when

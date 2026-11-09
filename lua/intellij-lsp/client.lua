@@ -324,6 +324,8 @@ end
 --- worse than no lens. Two things must hold before asking for them -- `run.lua` must have registered
 --- the `vim.lsp.commands` handler, and nvim-dap must actually be installed, since it owns the DAP
 --- session the handler starts. `run.has_dap()` is the second half of that check.
+--- `runTestCodeLens` does the same for the Run Test / Debug Test lenses above every test class and
+--- method, whose `intellij.jvm.runTest` command `test.lua` handles; gated the same way, and on `test`.
 --- `lazyIntentions` asks the server to *list* fixes without performing them; the fix runs when
 --- chosen, through the `applyModCommand` executeCommand that Neovim already dispatches from a code
 --- action's `command`. Without it the server performs every candidate fix while answering
@@ -347,6 +349,7 @@ function M.init_options(root_dir, cfg)
     intellijExtensions = cfg.intellij_extensions ~= false,
     lazyIntentions = cfg.intellij_extensions ~= false,
     runMainCodeLens = cfg.run ~= false and require('intellij-lsp.run').has_dap(),
+    runTestCodeLens = cfg.run ~= false and cfg.test ~= false and require('intellij-lsp.run').has_dap(),
   }
 end
 
@@ -993,6 +996,16 @@ function M.config(root_dir, cfg, consent)
             buffer = bufnr,
             desc = 'IntelliJ: run the code lens on this line',
           })
+          if cfg.test ~= false then
+            vim.keymap.set('n', prefix .. 'rt', function() require('intellij-lsp.test').run_at_cursor(true) end, {
+              buffer = bufnr,
+              desc = 'IntelliJ: run the test at the cursor (the method, else its class)',
+            })
+            vim.keymap.set('n', prefix .. 'rT', function() require('intellij-lsp.test').rerun() end, {
+              buffer = bufnr,
+              desc = 'IntelliJ: run the last test run again',
+            })
+          end
         end
 
         -- Nested under the `run` check rather than beside it: debugging is the same launch path with
