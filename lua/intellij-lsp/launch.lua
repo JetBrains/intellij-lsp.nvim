@@ -18,10 +18,10 @@ end
 --- keeps `:IntellijLspClearCache` scoped to a single project.
 ---
 --- `slot` is which of this root's cache directories: 1 is the plain one, 2 and up carry a suffix.
---- Two Neovim instances on the same project cannot share one -- the server holds an exclusive
---- RocksDB lock on its index and the second `initialize` fails outright with "While lock file:
---- ... Resource temporarily unavailable" -- so the second instance takes the next slot. See
---- `M.claim_system_path`.
+--- Slots are only for a bundle without `lsp-router` (before 271, or a dev build), whose server runs
+--- on stdio and keeps its index under this directory: two Neovims on one project cannot share one,
+--- as the server locks its index, so the second takes the next slot. A bundle with the router
+--- shares one server per project instead and uses slot 1 only; see `M.router_path`.
 --- @param root_dir string
 --- @param slot integer|nil defaults to 1
 --- @return string
@@ -113,7 +113,19 @@ end
 --- @return string[]
 function M.build_cmd(opts)
   local system_path = opts.system_path or M.system_path(opts.root_dir)
-  local cmd = { opts.server_path, '--stdio', '--system-path', system_path }
+  local cmd
+  if opts.router then
+    -- The router speaks stdio to us and TCP to the server, and starts the server itself, with
+    -- `--socket --multi-client --idle-timeout`; everything after `--` is passed on unchanged.
+    cmd = {
+      opts.router, '--server-launcher', opts.server_path,
+      '--workspace-id', opts.root_dir,
+      '--system-path', system_path,
+      '--',
+    }
+  else
+    cmd = { opts.server_path, '--stdio', '--system-path', system_path }
+  end
 
   -- Only a released bundle carries an EULA.txt to enforce; dev builds skip the check.
   if opts.accept_eula then
@@ -125,6 +137,52 @@ function M.build_cmd(opts)
   end
 
   return cmd
+end
+
+--- The `lsp-router` that ships beside the launcher, or nil for a bundle without one.
+---
+--- The router lets several Neovims on one project share a server. Since 271 the server keeps a
+--- workspace's index under the machine's cache root (`~/Library/Caches/JetBrains/IntelliJServer`,
+--- `~/.cache/JetBrains/IntelliJServer`), whatever `--system-path` says, so a second server on the
+--- same project fails `initialize` on the index lock. The router routes the second editor to the
+--- first one's server instead.
+--- @param server_path string|nil
+--- @return string|nil
+function M.router_path(server_path)
+  if not server_path then return nil end
+  local path = vim.fs.dirname(server_path) .. '/lsp-router'
+  return vim.fn.executable(path) == 1 and path or nil
+end
+
+--- The router's discovery file for a workspace: the server's port on the first line, its pid on
+--- the second, its build on the third. Same recipe as `workspace.rs` in `lsp-router`: the first 16
+--- hex digits of the SHA-256 of the workspace id, which `build_cmd` sets to the root.
+--- @param root_dir string
+--- @return string
+function M.port_file(root_dir)
+  local dir = vim.env.INTELLIJ_LSP_PORT_DIR
+  if not dir or vim.trim(dir) == '' then
+    dir = (vim.uv.os_tmpdir() or '/tmp'):gsub('/+$', '') .. '/intellij-lsp-servers'
+  end
+  return dir .. '/' .. vim.fn.sha256(root_dir):sub(1, 16) .. '.port'
+end
+
+--- The pid of the live shared server for a workspace, or nil when none runs.
+---
+--- A discovery file can outlive its server, and a pid can be reused, so the process must exist and
+--- still be the IntelliJ server before anyone signals it.
+--- @param root_dir string
+--- @return integer|nil
+function M.shared_server_pid(root_dir)
+  local fd = vim.uv.fs_open(M.port_file(root_dir), 'r', 438)
+  if not fd then return nil end
+  local data = vim.uv.fs_read(fd, 256, 0) or ''
+  vim.uv.fs_close(fd)
+  local pid = tonumber((data:match('^[^\n]*\n%s*(%d+)')))
+  if not pid or not pid_alive(pid) then return nil end
+  local ps = vim.system({ 'ps', '-o', 'command=', '-p', tostring(pid) }, { text = true }):wait()
+  if ps.code ~= 0 or not (ps.stdout or ''):find('intellij%-server') then return nil end
+  return pid
 end
 
 --- Quotes a JVM option for `IJ_JAVA_OPTIONS`, which the launcher splits on spaces.

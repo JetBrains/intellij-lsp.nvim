@@ -285,8 +285,13 @@ M.KILL_TIMEOUT = 5000
 local function stop_all(done)
   local index_dir
   local clients = vim.lsp.get_clients({ name = client.NAME, _uninitialized = true })
+  -- Roots whose server is shared through the router. Stopping the client only ends the router; the
+  -- server stays for other editors and for its idle timeout, and a restart that met it again would
+  -- restart nothing, a cache clear would delete the index under it.
+  local shared_roots = {}
   for _, c in ipairs(clients) do
     index_dir = index_dir or c.config.index_dir
+    if c.config.shared_root then shared_roots[#shared_roots + 1] = c.config.shared_root end
     progress.reset(c.id)
     status.reset(c.id)
     c:stop()
@@ -300,6 +305,8 @@ local function stop_all(done)
 
   stopping = stopping + 1
   local waited, forced = 0, false
+  -- Shared servers, once their clients are gone: pid -> when it was sent SIGTERM.
+  local servers, server_waited = nil, 0
   local timer = assert(vim.uv.new_timer())
   timer:start(0, 50, vim.schedule_wrap(function()
     if timer:is_closing() then return end
@@ -312,6 +319,28 @@ local function stop_all(done)
       end
       waited = waited + 50
       return
+    end
+    if #running == 0 and #shared_roots > 0 then
+      if not servers then
+        servers = {}
+        for _, root in ipairs(shared_roots) do
+          local pid = require('intellij-lsp.launch').shared_server_pid(root)
+          if pid then
+            servers[pid] = true
+            vim.uv.kill(pid, 'sigterm')
+          end
+        end
+      end
+      local alive = false
+      for pid in pairs(servers) do
+        local ok = vim.uv.kill(pid, 0)
+        if ok == 0 then alive = true else servers[pid] = nil end
+      end
+      if alive and server_waited < M.STOP_TIMEOUT then
+        server_waited = server_waited + 50
+        return
+      end
+      if alive then running = { true } end
     end
     timer:stop()
     timer:close()

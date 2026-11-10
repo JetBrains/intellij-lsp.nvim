@@ -43,6 +43,25 @@ check('dev bundle -> no --eula', not vim.tbl_contains(cmd, '--eula'), table.conc
 local cmd_slot = launch.build_cmd({ server_path = SERVER, root_dir = '/tmp/ijtest', accept_eula = false, system_path = '/tmp/ij-slot-2' })
 check('cmd uses the claimed system path', cmd_slot[4] == '/tmp/ij-slot-2', cmd_slot[4])
 
+-- Shared server: the router runs the launcher, and the workspace id pins which server it reaches.
+local cmd_router = launch.build_cmd({ server_path = SERVER, router = BUNDLE .. '/bin/lsp-router', root_dir = '/tmp/ijtest', accept_eula = false })
+check('router cmd starts the router', cmd_router[1] == BUNDLE .. '/bin/lsp-router', cmd_router[1])
+check('router cmd names the launcher', cmd_router[2] == '--server-launcher' and cmd_router[3] == SERVER, table.concat(cmd_router, ' '))
+check('router cmd pins the workspace id', cmd_router[4] == '--workspace-id' and cmd_router[5] == '/tmp/ijtest', table.concat(cmd_router, ' '))
+check('router cmd has no --stdio', not vim.tbl_contains(cmd_router, '--stdio'))
+check('router cmd ends its own options', cmd_router[#cmd_router] == '--', table.concat(cmd_router, ' '))
+check('no router beside a missing bundle', launch.router_path(SERVER) == nil)
+
+-- The discovery file follows lsp-router's recipe; this vector is pinned in its workspace.rs.
+local saved_port_dir = vim.env.INTELLIJ_LSP_PORT_DIR
+vim.env.INTELLIJ_LSP_PORT_DIR = '/tmp/ij-ports'
+check('port file matches the router', launch.port_file('/home/user/my-workspace') == '/tmp/ij-ports/e22d7af6977edd2e.port',
+  launch.port_file('/home/user/my-workspace'))
+vim.env.INTELLIJ_LSP_PORT_DIR = nil
+check('port file under the temp dir', launch.port_file('/x'):find('/intellij%-lsp%-servers/%x+%.port$') ~= nil, launch.port_file('/x'))
+vim.env.INTELLIJ_LSP_PORT_DIR = saved_port_dir
+check('no shared server without a discovery file', launch.shared_server_pid('/nonexistent/root') == nil)
+
 -- Slots: one cache directory per live Neovim instance on the same project.
 check('slot 1 is the plain path', launch.system_path('/tmp/ijtest', 1) == launch.system_path('/tmp/ijtest'))
 check('slot 2 is suffixed', launch.system_path('/tmp/ijtest', 2) == launch.system_path('/tmp/ijtest') .. '-2',

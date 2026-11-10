@@ -872,14 +872,24 @@ function M.config(root_dir, cfg, consent)
     return result
   end
 
-  -- One cache directory per live instance of this project; see `launch.claim_system_path`.
-  local system_path = launch.claim_system_path(root_dir)
-  claimed[system_path] = true
-  release_all_on_leave()
+  -- With the router, every Neovim on this project reaches one server, and that server's cache
+  -- directory is the root's plain one. A bundle without a router (before 271, or a dev build) gets
+  -- a server of its own on stdio, and one cache directory per live instance of this project; see
+  -- `launch.claim_system_path`.
+  local router = launch.router_path(cfg.server_path)
+  local system_path
+  if router then
+    system_path = launch.system_path(root_dir)
+  else
+    system_path = launch.claim_system_path(root_dir)
+    claimed[system_path] = true
+    release_all_on_leave()
+  end
   M.watch_init()
 
   local argv = launch.build_cmd({
     server_path = cfg.server_path,
+    router = router,
     root_dir = root_dir,
     accept_eula = consent.eula_accepted,
     system_path = system_path,
@@ -891,6 +901,12 @@ function M.config(root_dir, cfg, consent)
     cmd = launch.spawn(argv, env),
     -- What `cmd` runs, for the code that needs the launcher itself: `cmd` is a function.
     server_cmd = argv,
+    -- The IntelliJ launcher itself, for its CLI subcommands; `server_cmd[1]` is the router when
+    -- the server is shared.
+    server_launcher = cfg.server_path,
+    -- Set when the server is shared through the router: it outlives this client, and `stop_all`
+    -- finds it by the root's discovery file.
+    shared_root = router and root_dir or nil,
     cmd_env = env,
     root_dir = root_dir,
     -- Not a `vim.lsp.start` field: kept on the config so `:checkhealth` and the init watchdog can
@@ -1026,8 +1042,10 @@ function M.config(root_dir, cfg, consent)
       -- `progress = false` should not pay to load the module.
       require('intellij-lsp.status').reset(client_id)
       -- The server has let go of its index lock, so another instance may take this directory.
-      launch.release_system_path(system_path)
-      claimed[system_path] = nil
+      if not router then
+        launch.release_system_path(system_path)
+        claimed[system_path] = nil
+      end
       -- Exit code 7: the server's licensing check refused this build at startup. An unlicensed
       -- server does not exit; it starts and refuses requests instead.
       if code == 7 then

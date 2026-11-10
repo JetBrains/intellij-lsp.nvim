@@ -49,6 +49,21 @@ Or point the plugin at a server bundle you already have: >lua
 <
 Then run `:checkhealth intellij-lsp`.
 
+Several Neovims on one project                   *intellij-lsp-shared-server*
+
+Every Neovim on one project talks to the same server and the same index,
+through the `lsp-router` the bundle ships next to `bin/intellij-server`.
+The first Neovim starts the server; the server keeps running while any
+Neovim uses it and stops 10 seconds after the last one quits. Unsaved
+edits stay with the Neovim they were made in.
+
+`:IntellijLspRestart` and `:IntellijLspClearCache` stop the server, so
+they stop it for every Neovim on the project. A question the server asks
+at startup, such as which build tool to import, opens in only one of
+them; the others wait at "Initializing server" until it is answered.
+
+A bundle without `lsp-router` (before 271) starts one server per Neovim.
+
 ==============================================================================
 3. Licensing                                         *intellij-lsp-licensing*
 
@@ -531,7 +546,8 @@ debug
 ==============================================================================
 5. Commands                                            *intellij-lsp-commands*
 
-:IntellijLspRestart            Restart the server.
+:IntellijLspRestart            Restart the server, for every Neovim on the
+                                project (|intellij-lsp-shared-server|).
 :IntellijLspLicense            Show the license (status float), or
                                 activate one when there is none
                                 (|intellij-lsp-activation|).
@@ -549,9 +565,8 @@ debug
                                 data sharing apply on restart, which is
                                 offered; with no server running, it starts.
 :IntellijLspClearCache         Stop the server, delete the index, restart.
-                                The cache directory is per project; a second
-                                Neovim on the same project gets a `-2` suffixed
-                                one, as the server locks its index exclusively.
+                                Stops it for every Neovim on the project
+                                (|intellij-lsp-shared-server|).
 :IntellijLspOutput             Open the output panel: the build tool's
                                 import log and program output.
 :IntellijLspLog                Alias of :IntellijLspOutput.
