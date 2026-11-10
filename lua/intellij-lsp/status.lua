@@ -320,6 +320,27 @@ function M._legacy_line(text, percent)
   return TITLE .. ': ' .. (percent and (percent .. '% ') or '') .. text
 end
 
+--- Cuts `text` so the whole line Neovim draws for it fits in `space` cells.
+---
+--- A line wider than the message area wraps, and two lines in a one-line message area is the
+--- hit-enter prompt: Neovim stops and waits for Enter in the middle of the server's boot. The
+--- in-place progress message of 0.12 is drawn as `TITLE: [N% ]text`, the same shape as the 0.11
+--- line, so both are measured against that. `reserve` keeps room for what is appended after the
+--- cut, the animated dots, so the line does not wrap on the third dot either.
+--- @param text string
+--- @param percent integer|nil
+--- @param reserve integer|nil cells appended after `text`
+--- @param space integer|nil defaults to `v:echospace`
+--- @return string
+function M._fit(text, percent, reserve, space)
+  space = space or vim.v.echospace
+  if space <= 1 then return text end
+  local budget = space - 1 - vim.fn.strdisplaywidth(M._legacy_line('', percent)) - (reserve or 0)
+  if vim.fn.strdisplaywidth(text) <= budget then return text end
+  if budget < 1 then return '' end
+  return vim.fn.strcharpart(text, 0, budget - 1) .. '…'
+end
+
 --- The line waiting for `legacy_echo`'s timer, or nil when nothing is pending.
 --- @type string|nil
 local legacy_pending = nil
@@ -353,6 +374,8 @@ local function report(client_id)
 
   local text, percent, parked = M.text(client_id, st)
   if not text then return end
+  local dotted = not parked and percent == nil
+  text = M._fit(text, percent, dotted and (1 + DOT_FRAMES) or 0)
   -- Decorated here, at the echo, and nowhere else: `st` keeps the server's own wording, so nothing
   -- that reads the state ever sees a dot.
   if not parked then text = M.animate(text, percent, dot_frame) end
@@ -480,7 +503,7 @@ local function finish(client_id, final, announced)
     return
   end
 
-  local text = final or select(1, M.describe(st)) or ''
+  local text = M._fit(final or select(1, M.describe(st)) or '')
   pcall(vim.api.nvim_echo, { { text } }, false, {
     id = st.msg_id,
     kind = 'progress',

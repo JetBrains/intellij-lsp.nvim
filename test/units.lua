@@ -1763,6 +1763,16 @@ check('prose with a number is kept',
 -- The dots. Frames without a percentage get one to three trailing dots, so a line that can sit
 -- unchanged for minutes ("Importing: Maven") still reads as alive rather than hung. Pure on purpose:
 -- the frame is an argument, so all three frames and the wraparound are checked without a timer.
+-- The drawn line, `IntelliJ LSP: ` included, must fit the message area, or Neovim stops on the
+-- hit-enter prompt while the server boots.
+local long = 'Initializing server: Loading workspace model from cache'
+local fit = status._fit(long, nil, 4, 60)
+check('fit: a long line is cut to the width',
+  vim.fn.strdisplaywidth(status._legacy_line(fit .. ' ...')) <= 59, status._legacy_line(fit .. ' ...'))
+check('fit: the cut is marked', fit:sub(-3) == '…', fit)
+check('fit: a short line is left alone', status._fit('Ready', nil, 0, 60) == 'Ready')
+check('fit: the percent counts', vim.fn.strdisplaywidth(status._legacy_line(status._fit(long, 42, 0, 50), 42)) <= 49)
+check('fit: no width leaves the text', status._fit(long, nil, 0, 0) == long)
 check('frame 1 is one dot', status.animate('Importing: Maven', nil, 1) == 'Importing: Maven .',
   status.animate('Importing: Maven', nil, 1))
 check('frame 2 is two dots', status.animate('Importing: Maven', nil, 2) == 'Importing: Maven ..')
@@ -1938,6 +1948,8 @@ do
   vim.wait(500, function() return false end)
   check('parked: no dots ticking', #echoes == count, vim.inspect(echoes))
 
+  -- Wide enough for the whole server text: this is about the text coming back, not about `_fit`.
+  vim.o.columns = 200
   licensing._set(SID, { activeLicense = { source = 'activationCode', status = 'Valid', product = 'intellij-server' } })
   check('licensed: the server text comes back', echoes[#echoes].text:find('^Initializing server: Loading workspace model from cache%.%.%. %.+$') ~= nil,
     vim.inspect(echoes[#echoes]))
