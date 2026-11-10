@@ -139,6 +139,15 @@ function M.build_cmd(opts)
   return cmd
 end
 
+--- The IntelliJ launcher a client runs on, for its CLI subcommands (`license`, `login`).
+---
+--- Not `server_cmd[1]`: with the router that is `lsp-router`, which has no subcommands.
+--- @param config table a client's config
+--- @return string|nil
+function M.launcher_of(config)
+  return config.server_launcher or (config.server_cmd and config.server_cmd[1]) or nil
+end
+
 --- The `lsp-router` that ships beside the launcher, or nil for a bundle without one.
 ---
 --- The router lets several Neovims on one project share a server. Since 271 the server keeps a

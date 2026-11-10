@@ -338,7 +338,25 @@ function M._fit(text, percent, reserve, space)
   local budget = space - 1 - vim.fn.strdisplaywidth(M._legacy_line('', percent)) - (reserve or 0)
   if vim.fn.strdisplaywidth(text) <= budget then return text end
   if budget < 1 then return '' end
-  return vim.fn.strcharpart(text, 0, budget - 1) .. '…'
+  return M._cut_cells(text, budget - 1) .. '…'
+end
+
+--- The longest prefix of `text` that fits in `cells` display cells.
+---
+--- By cells, not characters: a double-width character, CJK in a file path for one, takes two, so
+--- `strcharpart` with a cell count would still overflow by up to twice the budget.
+--- @param text string
+--- @param cells integer
+--- @return string
+function M._cut_cells(text, cells)
+  local out, used = {}, 0
+  for _, ch in ipairs(vim.fn.split(text, [[\zs]])) do
+    local w = vim.fn.strdisplaywidth(ch, used)
+    if used + w > cells then break end
+    out[#out + 1] = ch
+    used = used + w
+  end
+  return table.concat(out)
 end
 
 --- The line waiting for `legacy_echo`'s timer, or nil when nothing is pending.
@@ -360,7 +378,7 @@ function M._legacy_echo(line)
     if not text then return end
     local space = vim.v.echospace
     if space > 1 and vim.fn.strdisplaywidth(text) > space then
-      text = vim.fn.strcharpart(text, 0, space - 1) .. '…'
+      text = M._cut_cells(text, space - 2) .. '…'
     end
     pcall(vim.api.nvim_echo, { { text } }, false, {})
   end, LEGACY_COALESCE_MS)

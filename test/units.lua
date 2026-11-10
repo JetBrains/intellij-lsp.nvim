@@ -1792,6 +1792,10 @@ check('fit: the cut is marked', fit:sub(-3) == '…', fit)
 check('fit: a short line is left alone', status._fit('Ready', nil, 0, 60) == 'Ready')
 check('fit: the percent counts', vim.fn.strdisplaywidth(status._legacy_line(status._fit(long, 42, 0, 50), 42)) <= 49)
 check('fit: no width leaves the text', status._fit(long, nil, 0, 0) == long)
+local wide = status._fit('Indexing: ' .. ('界'):rep(40), nil, 4, 60)
+check('fit: wide characters are cut by cells',
+  vim.fn.strdisplaywidth(status._legacy_line(wide .. ' ...')) <= 59, vim.fn.strdisplaywidth(status._legacy_line(wide .. ' ...')))
+check('fit: a cut never splits a wide character', status._cut_cells('a界b', 2) == 'a', status._cut_cells('a界b', 2))
 check('frame 1 is one dot', status.animate('Importing: Maven', nil, 1) == 'Importing: Maven .',
   status.animate('Importing: Maven', nil, 1))
 check('frame 2 is two dots', status.animate('Importing: Maven', nil, 2) == 'Importing: Maven ..')
@@ -3330,6 +3334,17 @@ do
   check('offer: with an environment license, says why instead', notified[2]
     and notified[2].msg:find('INTELLIJ_SERVER_LICENSE, which overrides', 1, true) ~= nil
     and notified[2].msg:find('license trial', 1, true) == nil, vim.inspect(notified[2]))
+
+  -- Through the router, `server_cmd[1]` is `lsp-router`, which has no `license` subcommand.
+  notified = {}
+  vim.notify = function(msg, level) table.insert(notified, { msg = msg, level = level }) end
+  local routed = { config = { server_cmd = { '/b/bin/lsp-router', '--server-launcher', '/b/bin/intellij-server' },
+    server_launcher = '/b/bin/intellij-server' } }
+  licensing.offer_activation(routed, licensing.project(CAPTURED_PARKED), nil)
+  vim.notify = orig_notify
+  check('offer: through the router, names the launcher', notified[1]
+    and notified[1].msg:find('/b/bin/intellij-server license trial', 1, true) ~= nil
+    and notified[1].msg:find('lsp-router', 1, true) == nil, vim.inspect(notified[1]))
 end
 end)()
 

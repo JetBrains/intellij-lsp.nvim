@@ -453,7 +453,7 @@ end
 --- @param client vim.lsp.Client
 function M.login_with_code(client)
   M.cancel_login(function()
-    signin.terminal_login(client.config.server_launcher or client.config.server_cmd[1], client.config.cmd_env)
+    signin.terminal_login(require('intellij-lsp.launch').launcher_of(client.config), client.config.cmd_env)
   end)
 end
 
