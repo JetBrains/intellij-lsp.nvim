@@ -600,8 +600,8 @@ debug
 ==============================================================================
 6. Navigation and editing                            *intellij-lsp-navigation*
 
-Neovim's built-in LSP mappings (`gd`, `K`, `gra`, `grn`, `grr`, `]d`, ...)
-all work. On top of them, in a Java or Kotlin buffer:
+Neovim's built-in LSP mappings (`CTRL-]` for definition, `K`, `gra`, `grn`,
+`grr`, `]d`, ...) all work. On top of them, in a Java or Kotlin buffer:
 
     <leader>ts    type hierarchy: subtypes of the class at the cursor
     <leader>tu    type hierarchy: supertypes

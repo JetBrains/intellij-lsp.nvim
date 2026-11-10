@@ -90,8 +90,8 @@ Over SSH the sign-in runs in a terminal, where you paste the code the sign-in pa
 (`:IntellijLspLicense login --code`). A license that is lost, enters its grace period or is about
 to end (a trial with 7 days, then 1 day left) is announced once, and
 `require('intellij-lsp').license()` puts it in your statusline (`IJ trial 5d`, `IJ unlicensed`).
-Without a license, a note at the end of each buffer's first line says so, `grr`, `gd` and `K` open the
-activation float naming what you asked for, and `gra` offers one action: activate a license.
+Without a license, a note at the end of each buffer's first line says so, `grr`, `CTRL-]` and `K` open
+the activation float naming what you asked for, and `gra` offers one action: activate a license.
 
 `:checkhealth intellij-lsp` shows each running server's license and the consent it was started
 with; `:help intellij-lsp-licensing` covers the rest, including the environment variables that
@@ -165,8 +165,8 @@ Then `:checkhealth intellij-lsp`.
 ## Shortcuts
 
 All mappings are buffer-local: the editor mappings exist only in buffers this server serves, the
-panel mappings only inside their panel. Everything else (`gd`, `K`, `gra`, `grn`, `]d`, ...) is
-Neovim's built-in LSP behaviour.
+panel mappings only inside their panel. Everything else (`CTRL-]` for definition, `K`, `gra`, `grn`,
+`]d`, ...) is Neovim's built-in LSP behaviour.
 
 The `<leader>` maps below can move to another prefix if they clash with your own:
 
