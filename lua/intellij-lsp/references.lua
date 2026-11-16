@@ -241,68 +241,24 @@ local function wipe_unopenable_buffers(items)
   end
 end
 
---- The window to preview in.
----
---- Normally the window `grr` was pressed in. If that window is gone -- closed while browsing, or grr
---- pressed in a split the user then closed -- fall back to any non-quickfix window in the tab.
---- Without the validity check, every preview after such a close raises E5555 from nvim_win_call on an
---- invalid handle.
----
---- Never splits: creating windows from a CursorMoved handler is how layouts get mangled. Returns nil
---- instead, and preview simply does nothing.
---- @return integer|nil
-local function preview_win()
-  local function usable(win)
-    if not win or not vim.api.nvim_win_is_valid(win) then return false end
-    return vim.bo[vim.api.nvim_win_get_buf(win)].buftype ~= 'quickfix'
-  end
-
-  if usable(state.origin.win) then return state.origin.win end
-
-  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    if usable(win) then return win end
-  end
-  return nil
-end
-
 --- Shows `item` in the editor window and flashes its match range.
+---
+--- The window is normally the one `grr` was pressed in. If that window is gone -- closed while
+--- browsing, or grr pressed in a split the user then closed -- preview.lua falls back to any other
+--- editor window in the tab; without that check, every preview after such a close raised E5555 from
+--- nvim_win_call on an invalid handle.
 --- @param item table quickfix entry with bufnr/lnum/col
 local function preview(item)
-  local win = preview_win()
+  local show = require('intellij-lsp.preview')
+  local win = show.window(state.origin.win)
   if not win or not item or item.valid == 0 or not item.bufnr then return end
   if not vim.api.nvim_buf_is_valid(item.bufnr) then return end
 
   local buf = item.bufnr
-  vim.fn.bufload(buf)
-
-  -- bufload does NOT run filetype detection, and neither does displaying the buffer in a window, so
-  -- without this the preview renders as unhighlighted plain text -- which defeats the point of it.
-  -- Skipped when already detected, since this runs on every step.
-  if vim.bo[buf].filetype == '' then
-    vim.api.nvim_buf_call(buf, function() vim.cmd('filetype detect') end)
-  end
-
-  -- `keepjumps keepalt buffer N`, not nvim_win_set_buf and not `:edit`:
-  --
-  --   * nvim_win_set_buf pushes a jumplist entry per call, so twenty j presses leave twenty junk
-  --     entries and <C-o> no longer walks back to where the user actually was.
-  --   * `:edit` additionally rewrites the alternate file, so <C-^> starts pointing at whichever
-  --     reference happened to be previewed last.
-  --   * `keepjumps keepalt` suppresses both.
-  --
-  -- 'eventignore' is deliberately NOT set around this: suppressing events would skip FileType and
-  -- kill syntax in the preview. That means the plugin's own FileType autocmd fires and
-  -- start_for_buffer attaches the buffer, which is intended -- find_root resolves to the same root,
-  -- vim.lsp.start reuses the running client rather than spawning a second server, and the
-  -- buffer-local intellij_lsp_attached guard makes a re-preview a no-op. The cost is one didOpen per
-  -- file, which is what a real jump would have cost anyway.
-  local ok = pcall(vim.api.nvim_win_call, win, function()
-    vim.cmd('keepjumps keepalt buffer ' .. buf)
-    local lnum = math.min(item.lnum or 1, vim.api.nvim_buf_line_count(buf))
-    vim.api.nvim_win_set_cursor(win, { math.max(lnum, 1), math.max((item.col or 1) - 1, 0) })
-    vim.cmd('normal! zz')
-  end)
-  if not ok then return end
+  if not show.load(buf) then return end
+  -- See preview.lua for why this neither jumps nor rewrites the alternate file, and why events stay
+  -- on: the plugin's own FileType autocmd attaching the previewed buffer is intended.
+  if not show.show(win, buf, item.lnum, item.col) then return end
 
   -- Re-asserted AFTER the switch: showing a buffer in a window lists it, so bufadd's unlisted state
   -- does not survive on its own. Keeps :ls free of every file scrolled past while browsing.

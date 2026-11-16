@@ -792,31 +792,72 @@ local function toggle_row()
   end
 end
 
-local function jump_to_frame_row()
-  local row = current_row()
-  if not row or row.kind ~= 'frame' or not row.frame or not row.frame.source then return end
-  local frame = row.frame
-  local path = frame.source.path
-  if not path then return end
-  local win = vim.fn.win_getid(vim.fn.winnr('#'))
-  if win == 0 then
-    vim.cmd('wincmd p')
-    win = vim.api.nvim_get_current_win()
-  end
+--- Shows `frame`'s source line in an editor window, focus staying in the panel.
+---
+--- `source.path` is a URI (`file:///...`, or `jar:` for a library frame), so it goes through
+--- preview.lua rather than `:edit`: `:edit file:///x` opened an empty buffer named after the URI
+--- wherever netrw was off, and the cursor move to the frame's line then failed with "Invalid cursor
+--- line: out of range" (issue #8).
+---
+--- A frame with no line -- the adapter's `-1` for a JDK lambda's `Unknown Source` -- shows nothing:
+--- its source is the class the lambda was written in, at no line that ran, so line 1 would mislead.
+--- @param frame table a DAP StackFrame
+--- @param preferred integer|nil the editor window to use if it still is one
+local function preview_frame(frame, preferred)
+  local path = frame and frame.source and frame.source.path
+  if not panel or not path or not frame.line or frame.line <= 0 then return end
+  local show = require('intellij-lsp.preview')
+  local win = show.window(preferred, panel.root_win)
+  if not win then return end
+  local buf = show.buffer(path)
+  local gen = generation
+  if not show.load(buf) then return end
+  -- Loading a library frame waits on the decompiler, and that wait runs events: a resume or a new
+  -- stop that landed meanwhile has made this frame stale, so neither show nor mark it.
+  if not panel or gen ~= generation or not vim.api.nvim_win_is_valid(win) then return end
+  local lnum = show.show(win, buf, frame.line, frame.column)
+  if not lnum then return end
+  -- The real execution point already gets nvim-dap's own DapStopped/debugPC highlight; only a
+  -- non-top frame previewed here needs this module's own line highlight.
   local top_frame = panel.frames and panel.frames[1]
-  local is_top_frame = top_frame ~= nil and frame.id == top_frame.id
-  vim.api.nvim_win_call(win, function()
-    vim.cmd('keepjumps edit ' .. vim.fn.fnameescape(path))
-    vim.api.nvim_win_set_cursor(win, { frame.line or 1, math.max((frame.column or 1) - 1, 0) })
-    vim.cmd('normal! zz')
-    -- The real execution point already gets nvim-dap's own DapStopped/debugPC highlight; only a
-    -- non-top frame previewed here needs this module's own line highlight.
-    if is_top_frame then
-      clear_frame_preview()
-    else
-      set_frame_preview(vim.api.nvim_get_current_buf(), frame.line or 1)
-    end
-  end)
+  if top_frame ~= nil and frame.id == top_frame.id then
+    clear_frame_preview()
+  else
+    set_frame_preview(buf, lnum)
+  end
+end
+
+--- The editor window the panel was entered from, which is where a frame is shown. Read in the panel.
+--- @return integer|nil
+local function previous_win()
+  local win = vim.fn.win_getid(vim.fn.winnr('#'))
+  return win ~= 0 and win or nil
+end
+
+--- Same settle time as references.lua: holding `j` down the stack loads the frame you stop on, not
+--- every library class on the way, each of which may block on a decompile.
+local PREVIEW_DEBOUNCE_MS = 60
+local preview_timer = nil
+
+--- Previews the frame under the cursor once the cursor settles.
+---
+--- Never straight from the `CursorMoved` callback: a callback that is not `nested` fires no other
+--- autocmds, so the `BufReadCmd` that loads a `jar:` frame and the `FileType` that attaches a project
+--- file never ran, and the frame line landed in an empty buffer. The timer's `vim.schedule` runs it
+--- outside the autocmd.
+local function preview_frame_later()
+  local row = current_row()
+  if not row or row.kind ~= 'frame' then return end
+  local frame, preferred = row.frame, previous_win()
+  preview_timer = preview_timer or vim.uv.new_timer()
+  preview_timer:stop()
+  preview_timer:start(PREVIEW_DEBOUNCE_MS, 0, vim.schedule_wrap(function()
+    -- The cursor can have left the row, a stop re-rendered the stack, or the panel closed by now --
+    -- or focus left the panel, and the window the user went back to is the one a preview would take.
+    if not panel or vim.api.nvim_get_current_win() ~= panel.root_win then return end
+    local now = current_row()
+    if now and now.kind == 'frame' and now.frame == frame then preview_frame(frame, preferred) end
+  end))
 end
 
 local function prompt_evaluate()
@@ -923,12 +964,8 @@ function M.open()
     end
     map('<CR>', function()
       local row = current_row()
-      if row and row.kind == 'frame' then
-        toggle_row()
-        jump_to_frame_row()
-      else
-        toggle_row()
-      end
+      toggle_row()
+      if row and row.kind == 'frame' then preview_frame(row.frame, previous_win()) end
     end, 'IntelliJ: jump to frame, or expand/collapse a variable')
     map('<Tab>', toggle_row, 'IntelliJ: expand/collapse')
     map('zo', toggle_row, 'IntelliJ: expand')
@@ -949,10 +986,7 @@ function M.open()
     vim.api.nvim_create_autocmd('CursorMoved', {
       group = panel.augroup,
       buffer = buf,
-      callback = function()
-        local row = current_row()
-        if row and row.kind == 'frame' then jump_to_frame_row() end
-      end,
+      callback = preview_frame_later,
       desc = 'IntelliJ: preview the selected frame',
     })
   end

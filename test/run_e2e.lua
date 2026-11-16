@@ -246,9 +246,29 @@ local debug_main = find_lens(main_lenses, 'intellij.jvm.runMain', function(a) re
 check('main: the server sends a Debug lens', debug_main ~= nil)
 if debug_main then
   local stopped_at = nil
+  local preview = nil -- what the debug panel's call stack showed for the top frame
   dap.listeners.after.event_stopped['run_e2e_main'] = function(session)
     vim.defer_fn(function()
       stopped_at = session.current_frame and session.current_frame.line or -1
+      -- Step onto the top frame row in the panel: its source, a `file:///` URI from the server, has
+      -- to land as the real file at the frame line (issue #8), with no netrw under `-u NONE`.
+      local panel_win
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(win)) == 'intellij-lsp://debug' then panel_win = win end
+      end
+      local editor_win = vim.fn.bufwinid(vim.fn.bufnr(MAIN))
+      if panel_win and editor_win ~= -1 then
+        vim.api.nvim_set_current_win(panel_win)
+        vim.v.errmsg = ''
+        vim.api.nvim_win_set_cursor(panel_win, { 2, 0 })
+        vim.api.nvim_exec_autocmds('CursorMoved', { buffer = vim.api.nvim_win_get_buf(panel_win) })
+        vim.wait(2000, function()
+          return vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(editor_win)) == MAIN
+            and vim.api.nvim_win_get_cursor(editor_win)[1] == 5
+        end, 20)
+        preview = { err = vim.v.errmsg, name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(editor_win)),
+          line = vim.api.nvim_win_get_cursor(editor_win)[1] }
+      end
       dap.continue()
     end, 500)
   end
@@ -259,6 +279,8 @@ if debug_main then
   click(debug_main, main_buf)
   check('debug main: the session ends', vim.wait(600000, function() return terminated > 0 end, 200))
   check('debug main: stopped on the breakpoint in main', stopped_at == 5, tostring(stopped_at))
+  check('debug main: the panel previews the frame in the real file, no error',
+    preview and preview.err == '' and preview.name == MAIN and preview.line == 5, vim.inspect(preview))
   -- The plain-JVM route sends no DAP `exited` event, so the exit code is checked only when one came.
   check('debug main: then ran to the end', (exit_code == nil or exit_code == 0)
     and panel_text():find('Hello, world!', 1, true) ~= nil,
