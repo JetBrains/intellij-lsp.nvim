@@ -196,6 +196,7 @@ line. Failed tests also go to the quickfix list (`:copen`), each on the line tha
 
 | Key | Action |
 |---|---|
+| `CTRL-]` | go to definition, into libraries and the JDK too (`CTRL-T` jumps back) |
 | `<CR>` (insert mode) | accept the selected completion; opens a line when no menu is visible |
 | `grr` | browse references with a live preview |
 | `<leader>ts` / `<leader>tu` | type hierarchy: subtypes / supertypes of the class at the cursor |
