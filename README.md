@@ -1,5 +1,7 @@
 # IntelliJ LSP for Neovim — ⚠️ EXPERIMENTAL ⚠️
 
+https://github.com/user-attachments/assets/54f27900-c93a-4399-b78f-ac0a93856244
+
 A Neovim client for the `intellij-server` bundle: indexing, navigation, diagnostics, completion,
 quick fixes and refactorings, type and call hierarchy, formatting, file templates, run/debug and
 git for Java and Kotlin from a single server. Requires Neovim 0.11+ and about 2 GB of free memory
